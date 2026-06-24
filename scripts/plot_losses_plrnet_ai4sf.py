@@ -30,7 +30,7 @@ COLORS = {
 
 def find_latest_run():
     """Return the most recent timestamped run folder that contains a metrics.csv."""
-    base    = "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net"
+    base    = "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp"
     pattern = os.path.join(base, "*/metrics.csv")
     runs    = sorted(glob.glob(pattern))
     if not runs:

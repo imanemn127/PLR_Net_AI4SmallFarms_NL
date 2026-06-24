@@ -196,11 +196,11 @@ def get_poly_crowdai(prop, mask_pred, junctions):
         if len(c) > 3:
             init_poly = c.copy()
             if len(junctions) > 0:
-                cj_match_ = np.argmin(cdist(c, junctions), axis=1)  
+                cj_match_ = np.argmin(cdist(c, junctions), axis=1)
 
-                cj_dis = cdist(c, junctions)[np.arange(len(cj_match_)), cj_match_] 
+                cj_dis = cdist(c, junctions)[np.arange(len(cj_match_)), cj_match_]
 
-                u, ind = np.unique(cj_match_[cj_dis < 3], return_index=True)  # Test A: tightened from 5 px to 3 px
+                u, ind = np.unique(cj_match_[cj_dis < 5], return_index=True)
                 if len(u) > 2:
 
                     ppoly = junctions[u[np.argsort(ind)]]
@@ -239,7 +239,7 @@ def get_poly_inria(prop, mask_pred, junctions, pid):
             if len(junctions) > 0:
                 cj_match_ = np.argmin(cdist(contour, junctions), axis=1)
                 cj_dis = cdist(contour, junctions)[np.arange(len(cj_match_)), cj_match_]
-                u, ind = np.unique(cj_match_[cj_dis < 3], return_index=True)  # Test A: tightened from 5 px to 3 px
+                u, ind = np.unique(cj_match_[cj_dis < 5], return_index=True)
                 if len(u) > 2:
                     ppoly = junctions[u[np.argsort(ind)]]
                     #ppoly = np.concatenate((ppoly, ppoly[0].reshape(-1, 2)))

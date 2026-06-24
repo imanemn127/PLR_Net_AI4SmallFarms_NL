@@ -41,7 +41,9 @@ That gap creates several concrete problems:
 
 ---
 
-## Dataset
+## Datasets
+
+### AI4SmallFarms (Vietnam / Cambodia)
 
 Sentinel-2 Level-2A, bands B4/B3/B2 (Red, Green, Blue), patches **256 × 256 px**.
 
@@ -71,6 +73,20 @@ Normalisation stats computed on training split (reflectance in [0, 1]):
 | B4 (R)  | 0.1036 | 0.0540 |
 | B3 (G)  | 0.0983 | 0.0346 |
 | B2 (B)  | 0.0688 | 0.0309 |
+
+### Netherlands BRP (national reconstruction)
+
+Reconstruction of the dataset used in the original PLR-Net article (Table 10),
+built from open sources (GEE Sentinel-2 mosaic + PDOK BRP 2020).
+
+| Split | Patches | Annotations |
+|-------|---------|-------------|
+| train | 5,553 | 358,996 |
+| val | 1,389 | 89,838 |
+| test | 1,505 | 96,910 |
+
+See [`data_nl/README_NL.md`](data_nl/README_NL.md) for the full pipeline
+(mosaic → rasterization → patch extraction → COCO JSON → training).
 
 ---
 
@@ -548,6 +564,31 @@ at 0.8 m/px, where field corners are sharp and span several pixels. On Sentinel-
 branch cannot reliably classify background / concave / convex at that scale. The mask
 branch finds rough foreground regions but cannot separate adjacent parcels because shared
 boundaries are sub-pixel. These are structural mismatches between the model and the data.
+
+### Preliminary experiment — `sentinel-2-nl` subset (87 tiles)
+
+Before reconstructing the full national dataset, the model was evaluated on the
+`sentinel-2-nl` subset of AI4SmallFarms: 87 tiles of ~1 km² each, acquired over the
+Netherlands with the same BRP 2020 labels. Evaluated with `best_val_loss.pth` from a
+training run on this subset.
+
+| Metric | This run | PLR-Net article |
+|--------|----------|-----------------|
+| **Mask IoU (%)** | **67.4** | **75.86** |
+| AP polygon (%) | ~0.8 | 47.1 |
+| AR polygon (%) | ~2.6 | 55.5 |
+| Junction recall @3 px | 0.563 | — |
+| Junction recall @8 px | 0.851 | — |
+| Mean pred / GT polygons per tile | 57.5 / 101.0 | — |
+
+**Interpretation:** Mask IoU at 67.4% is close to the article (75.86%), confirming the
+model generalises well to Netherlands imagery. However, AP/AR polygon metrics collapse
+to <1% vs 47–55% in the article — the mask branch merges adjacent parcels into coarse
+blobs and the junction branch fails to split them into individual polygons. The root
+cause is the training set size: 87 km² vs ~64,800 km² in the article (7× less data),
+causing severe under-segmentation (pred/GT = 0.57). This result motivated reconstructing
+the full national dataset from open sources
+(see [`data_nl/README_NL.md`](data_nl/README_NL.md)).
 
 ---
 
