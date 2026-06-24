@@ -118,7 +118,7 @@ def draw_polygons(ax, polys, color, label):
 # ------------------------------------------------------------------ #
 #  visualization 
 # ------------------------------------------------------------------ #
-def _render_viz(img_disp, gt_polys, pred_polys, epoch, img_name, viz_dir):
+def _render_viz(img_disp, gt_polys, pred_polys, epoch, img_name, viz_dir, split):
     """Save one GT | Pred side-by-side figure."""
     fig, axes = plt.subplots(1, 2, figsize=(8, 4), dpi=150)
     fig.patch.set_facecolor('black')
@@ -129,8 +129,11 @@ def _render_viz(img_disp, gt_polys, pred_polys, epoch, img_name, viz_dir):
         draw_polygons(axes[0], gt_polys,   '#00ff00', 'GT'),
         draw_polygons(axes[1], pred_polys, '#ff6600', 'Pred'),
     ]
-    axes[0].set_title(f"GT   epoch {epoch:03d}", color='white', fontsize=8)
-    axes[1].set_title(f"Pred epoch {epoch:03d}", color='white', fontsize=8)
+    short_name = img_name[-40:] if len(img_name) > 40 else img_name
+    axes[0].set_title(f"[{split}] GT  |  epoch {epoch:03d}\n{short_name}",
+                      color='white', fontsize=7)
+    axes[1].set_title(f"[{split}] Pred  |  epoch {epoch:03d}\n{short_name}",
+                      color='white', fontsize=7)
     axes[1].legend(handles=patches, loc='upper right', fontsize=6, framealpha=0.5)
     plt.tight_layout(pad=0.3)
     plt.savefig(os.path.join(viz_dir, f"{epoch:03d}_{img_name}.png"),
@@ -138,81 +141,60 @@ def _render_viz(img_disp, gt_polys, pred_polys, epoch, img_name, viz_dir):
     plt.close(fig)
 
 
+def _pick_dense_sparse_ids(coco_obj):
+    """Return (dense_img_id, sparse_img_id) using only the COCO annotation index."""
+    img_ids = sorted(coco_obj.getImgIds())
+    counts  = {iid: len(coco_obj.getAnnIds(imgIds=[iid])) for iid in img_ids}
+    dense_id  = max(counts, key=counts.get)
+    sparse_id = min((iid for iid in img_ids if counts[iid] > 0), key=counts.get)
+    return dense_id, sparse_id
+
+
 def select_viz_indices_val(val_loader):
     """
-    Scan val_loader once (no shuffle) and return the indices of:
-      - the image with the most GT polygons (dense)
-      - the image with the fewest GT polygons >= 1 (sparse)
-    Returns list of (flat_index, images_batch, b_in_batch, annotation).
-    Called once before training starts.
+    Pick dense + sparse viz samples using COCO index only (no full scan).
+    Returns list of (images_tensor, b, annotation).
     """
-    coco_obj = val_loader.dataset.coco
-    best = {'dense': (None, -1), 'sparse': (None, float('inf'))}
-    flat_idx = 0
-    entries = {}
+    from torch.utils.data import DataLoader as _DL
 
-    for images, annotations in val_loader:
-        for b in range(images.shape[0]):
-            ann    = annotations[b]
-            img_id = ann.get('img_id', None)
-            count  = (sum(len(a['segmentation'])
-                          for a in coco_obj.loadAnns(coco_obj.getAnnIds(imgIds=[img_id])))
-                      if img_id is not None else 0)
-            entries[flat_idx] = (images, b, ann, count)
-            if count > best['dense'][1]:
-                best['dense'] = (flat_idx, count)
-            if 0 < count < best['sparse'][1]:
-                best['sparse'] = (flat_idx, count)
-            flat_idx += 1
+    dataset  = val_loader.dataset
+    coco_obj = dataset.coco
+    dense_id, sparse_id = _pick_dense_sparse_ids(coco_obj)
 
-    selected = []
-    for key in ('dense', 'sparse'):
-        idx = best[key][0]
-        if idx is not None:
-            selected.append(entries[idx][:3])  # (images, b, ann)
+    id_to_idx = {iid: i for i, iid in enumerate(dataset.ids)}
+    selected  = []
+    for target_id in [dense_id, sparse_id]:
+        idx          = id_to_idx[target_id]
+        image, ann   = dataset[idx]           # (tensor, dict)
+        images       = image.unsqueeze(0)
+        selected.append((images, 0, ann))
     return selected
 
 
 def select_viz_indices_train(train_dataset_obj, transform):
     """
-    Scan the raw train dataset once with shuffle=False and return:
-      - index of the sample with the most GT mask contours (dense)
-      - index of the sample with the fewest GT mask contours >= 1 (sparse)
-    Returns list of (images_tensor, b=0, annotation) loaded at those indices.
-    Called once before training starts.
+    Pick dense + sparse viz samples using COCO index only (no full scan).
+    Returns list of (images_tensor, b=0, annotation).
     """
     from torch.utils.data import DataLoader as _DL
     from PLRNet.dataset.train_dataset import collate_fn as _train_collate
-    probe_loader = _DL(train_dataset_obj, batch_size=1,
-                       shuffle=False, collate_fn=_train_collate,
-                       num_workers=0)
-    best = {'dense': (None, -1), 'sparse': (None, float('inf'))}
-    entries = {}
 
     coco_obj = train_dataset_obj.coco
-    img_ids  = train_dataset_obj.images  # ordered list of COCO image IDs
-    for idx, (images, annotations) in enumerate(probe_loader):
-        ann    = annotations[0]
-        img_id = img_ids[idx]
-        ann['filename'] = coco_obj.loadImgs(ids=[img_id])[0]['file_name']
-        mask = ann.get('mask', None)
-        count = 0
-        if mask is not None:
-            m = mask.cpu().numpy() if torch.is_tensor(mask) else np.array(mask)
-            contours, _ = cv2.findContours(
-                (m * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            count = len([c for c in contours if len(c) >= 3])
-        entries[idx] = (images, 0, ann, count)
-        if count > best['dense'][1]:
-            best['dense'] = (idx, count)
-        if 0 < count < best['sparse'][1]:
-            best['sparse'] = (idx, count)
+    img_ids  = train_dataset_obj.images
+    dense_id, sparse_id = _pick_dense_sparse_ids(coco_obj)
 
-    selected = []
-    for key in ('dense', 'sparse'):
-        idx = best[key][0]
-        if idx is not None:
-            selected.append(entries[idx][:3])  # (images, b, ann)
+    id_to_idx = {iid: i for i, iid in enumerate(img_ids)}
+    selected  = []
+    for target_id in [dense_id, sparse_id]:
+        idx             = id_to_idx[target_id]
+        images, anns    = next(iter(
+            _DL(train_dataset_obj, batch_size=1, shuffle=False,
+                collate_fn=_train_collate, num_workers=0,
+                sampler=torch.utils.data.SubsetRandomSampler([idx]))
+        ))
+        ann             = anns[0]
+        ann['filename'] = coco_obj.loadImgs(ids=[target_id])[0]['file_name']
+        selected.append((images, 0, ann))
     return selected
 
 
@@ -243,7 +225,7 @@ def visualize_val(model, val_viz_entries, coco_obj, epoch, output_dir, mean, std
                         for a in coco_obj.loadAnns(coco_obj.getAnnIds(imgIds=[img_id]))
                         for seg in a['segmentation']]
         pred_polys = output['polys_pred'][b] if output['polys_pred'] else []
-        _render_viz(img_disp, gt_polys, pred_polys, epoch, img_name, viz_dir)
+        _render_viz(img_disp, gt_polys, pred_polys, epoch, img_name, viz_dir, split='val')
 
 
 # ------------------------------------------------------------------ #
@@ -275,7 +257,7 @@ def visualize_train(model, train_viz_entries, epoch, output_dir, mean, std):
                 (m * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             gt_polys = [c.reshape(-1, 2) for c in contours if len(c) >= 3]
         pred_polys = output['polys_pred'][b] if output['polys_pred'] else []
-        _render_viz(img_disp, gt_polys, pred_polys, epoch, img_name, viz_dir)
+        _render_viz(img_disp, gt_polys, pred_polys, epoch, img_name, viz_dir, split='train')
 
     model.train()
 

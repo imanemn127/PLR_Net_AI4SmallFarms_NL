@@ -11,7 +11,14 @@ build/
 dist/
 
 # Data (large files — not versioned)
+*.tif
+*.gpkg
 data/
+data_nl/mosaic_sentinel2/
+data_nl/brp/
+data_nl/labels_raster/
+data_nl/patches/
+data_nl/coco/
 PLR-Net_output/
 
 # Jupyter

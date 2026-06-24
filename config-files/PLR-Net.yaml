@@ -1,8 +1,8 @@
 SOLVER:
-  IMS_PER_BATCH: 1
-  BASE_LR: 1e-4
+  IMS_PER_BATCH: 8
+  BASE_LR: 8e-4
   MAX_EPOCH: 150
-  STEPS: (60, 110)   # Test B: was (13,) — give jloc branch more time at high LR
+  STEPS: (13,)   # Test B: (60,110)
   WEIGHT_DECAY: 0.0001
   CHECKPOINT_PERIOD: 1
   OPTIMIZER: "ADAM"
@@ -13,8 +13,8 @@ DATALOADER:
 
 DATASETS:
   IMAGE:
-    PIXEL_MEAN: [0.1036, 0.0983, 0.0688]
-    PIXEL_STD: [0.0540, 0.0346, 0.0309]
+    PIXEL_MEAN: [0.0545, 0.0768, 0.0668]
+    PIXEL_STD: [0.0298, 0.0314, 0.0397]
     TO_255: False
     HEIGHT: 256
     WIDTH: 256
@@ -25,8 +25,8 @@ DATASETS:
     HEIGHT: 256
     WIDTH: 256
   ROTATE_F: True   # enable full D4 augmentation (flips + 90/270 rotations)
-  TRAIN: ("ai4sf_train",)
-  TEST: ("ai4sf_val",)
+  TRAIN: ("nl_brp_train",)
+  TEST: ("nl_brp_val",)
 
 
 MODEL:
@@ -34,10 +34,10 @@ MODEL:
   HEAD_SIZE: [[2]]
   OUT_FEATURE_CHANNELS: 64
   LOSS_WEIGHTS:
-    loss_joff: 0.0    # temporarily disabled – offset regression competes with junction classification and degrades mask IoU
-    loss_jloc: 8.0    # restored to default
+    loss_joff: 0.25    # joff  regression
+    loss_jloc: 8.0     # jloc  classification
     loss_mask: 1.0
     loss_afm : 0.1
     loss_remask : 1.0
 
-OUTPUT_DIR: "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net"
+OUTPUT_DIR: "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp"

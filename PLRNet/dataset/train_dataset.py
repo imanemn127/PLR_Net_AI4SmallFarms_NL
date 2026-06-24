@@ -114,6 +114,7 @@ class TrainDataset(Dataset):
             with rasterio.open(img_path) as src:
                 # bands are 1-indexed in rasterio; read first 3 (R,G,B)
                 image = src.read([1, 2, 3]).transpose(1, 2, 0).astype(np.float32) / 10000.0
+            np.nan_to_num(image, nan=0.0, copy=False)  # replace mosaic NoData NaNs with 0
         else:
             image = io.imread(img_path).astype(np.float32)[:, :, :3]
             if image.max() > 1.0:

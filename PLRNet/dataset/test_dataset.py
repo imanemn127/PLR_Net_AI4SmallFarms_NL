@@ -37,6 +37,7 @@ class TestDatasetWithAnnotations(dset.coco.CocoDetection):
         if img_path.lower().endswith(('.tif', '.tiff')):
             with rasterio.open(img_path) as src:
                 image = src.read([1, 2, 3]).transpose(1, 2, 0).astype(np.float32) / 10000.0
+            np.nan_to_num(image, nan=0.0, copy=False)  # replace mosaic NoData NaNs with 0
         else:
             pil_img = Image.open(img_path).convert('RGB')
             image   = np.array(pil_img).astype(np.float32)

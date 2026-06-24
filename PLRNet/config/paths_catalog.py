@@ -35,6 +35,30 @@ class DatasetCatalog(object):
             'img_dir': 'ai4sf_256px_area50',
             'ann_file': 'ai4sf_256px_area50/test_coco.json'
         },
+        'nl_train': {
+            'img_dir': 'nl_256px_area100',
+            'ann_file': 'nl_256px_area100/train_coco.json'
+        },
+        'nl_val': {
+            'img_dir': 'nl_256px_area100',
+            'ann_file': 'nl_256px_area100/val_coco.json'
+        },
+        'nl_test': {
+            'img_dir': 'nl_256px_area100',
+            'ann_file': 'nl_256px_area100/test_coco.json'
+        },
+        'nl_brp_train': {
+            'img_dir': '../data_nl/patches',
+            'ann_file': '../data_nl/coco/train_coco.json'
+        },
+        'nl_brp_val': {
+            'img_dir': '../data_nl/patches',
+            'ann_file': '../data_nl/coco/val_coco.json'
+        },
+        'nl_brp_test': {
+            'img_dir': '../data_nl/patches',
+            'ann_file': '../data_nl/coco/test_coco.json'
+        },
     }
 
     @staticmethod
