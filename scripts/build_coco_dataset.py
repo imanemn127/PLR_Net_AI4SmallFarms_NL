@@ -6,9 +6,9 @@ Build a COCO-format dataset of 256×256 pixel patches from AI4SmallFarms
 Sentinel-2 tiles (Asia subset), using reference polygon files (_areas.gpkg).
 
 Output:
-  /mnt/DATA/IMANE/PLR-Net/data/ai4sf_256px_area50/train/train_coco.json
-  /mnt/DATA/IMANE/PLR-Net/data/ai4sf_256px_area50/val/val_coco.json
-  /mnt/DATA/IMANE/PLR-Net/data/ai4sf_256px_area50/test/test_coco.json
+  /home/imane/DATA/PLR-Net/data/nl_256px_area100/train_coco.json
+  /home/imane/DATA/PLR-Net/data/nl_256px_area100/val_coco.json
+  /home/imane/DATA/PLR-Net/data/nl_256px_area100/test_coco.json
 
 Each patch image is stored as a GeoTIFF cropped from the original tile.
 File names in the JSON follow the pattern:
@@ -38,11 +38,11 @@ from tqdm import tqdm
 # Configuration 
 # ---------------------------------------------------------------------------
 
-SRC_ROOT = "/home/imane/DATA/AI4SmallFarms/sentinel-2-asia"  # read-only source
-DST_ROOT = "/mnt/DATA/IMANE/PLR-Net/data/ai4sf_256px_area50"        # all outputs go here
+SRC_ROOT = "/mnt/DATA/IMANE/AI4SmallFarms/sentinel-2-nl"   # read-only source
+DST_ROOT = "/home/imane/DATA/PLR-Net/data/nl_256px_area100"  # all outputs go here
 
 PATCH_SIZE = 256        # patch size in pixels — 2.56 km × 2.56 km at 10 m/px
-STRIDE     = 256        # stride = patch size → contiguous, no overlap
+STRIDE     = 205        # stride = 256 × 0.8 = 205 px → 20% overlap
 CATEGORY   = {"id": 1, "name": "field"}
 
 # Set to a small integer (e.g. 2) to process only the first N tiles per split.
@@ -50,7 +50,7 @@ CATEGORY   = {"id": 1, "name": "field"}
 TEST_LIMIT = None
 
 # Minimum polygon area (px²) to keep — filters out tiny slivers after clipping
-MIN_AREA_PX = 50
+MIN_AREA_PX = 100
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +306,7 @@ def build_coco_json(all_image_records: list,
         "info": {
             "year": 2024,
             "version": "1.0",
-            "description": "AI4SmallFarms Asia — COCO patches for Pix2Poly",
+            "description": "AI4SmallFarms NL — COCO patches for PLR-Net",
             "contributor": "",
             "url": "",
             "date_created": "",

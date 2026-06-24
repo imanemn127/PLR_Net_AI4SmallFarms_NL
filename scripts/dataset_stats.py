@@ -20,7 +20,7 @@ from collections import defaultdict
 
 import numpy as np
 
-DATA_ROOT = "/mnt/DATA/IMANE/PLR-Net/data/ai4sf_256px_area100"
+DATA_ROOT = "/mnt/DATA/IMANE/PLR-Net/data/nl_256px_area50"
 
 JSON_FILES = {
     "train": os.path.join(DATA_ROOT, "train_coco.json"),

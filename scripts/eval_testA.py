@@ -2,13 +2,13 @@
 """
 eval_testA.py -- Test A: post-processing evaluation (no retraining needed)
 Run inference on all 24 val images using the best Run 7 checkpoint
-and the modified polygon.py thresholds (NMS 0.004, matching 3px).
+and the modified polygon.py thresholds (matching 3px).
 
 Usage (from PLR-Net/ directory):
   /mnt/DATA/IMANE/ai4sf/bin/python scripts/eval_testA.py \
       --config  config-files/PLR-Net.yaml \
-      --checkpoint /home/imane/DATA/PLR-Net_output/PLR-Net/2026-06-08_14-05-29/checkpoints/best_val_loss.pth \
-      --output  /home/imane/DATA/PLR-Net_output/TestA
+      --checkpoint /home/imane/DATA/PLR-Net_output/PLR-Net/nl/2026-06-15_09-44-20/checkpoints/best_val_loss.pth \
+      --output  /home/imane/DATA/PLR-Net_output/TestA/nl
 """
 
 import argparse
@@ -168,11 +168,9 @@ def main():
     model.eval()
     print(f"[TestA]  Checkpoint loaded (epoch {ckpt_epoch})")
 
-    data_root = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "data", "ai4sf_256px_area50"
-    )
-    ann_file = os.path.join(data_root, "val_coco.json")
+    base      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_root = os.path.join(base, "data_nl", "patches")
+    ann_file  = os.path.join(base, "data_nl", "coco", "test_coco.json")
     coco_obj = COCO(ann_file)
     img_ids  = coco_obj.getImgIds()
     print(f"[TestA]  {len(img_ids)} validation images\n")
