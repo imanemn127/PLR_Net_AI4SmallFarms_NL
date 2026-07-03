@@ -25,9 +25,30 @@ from PLRNet.utils.logger import setup_logger
 from PLRNet.utils.miscellaneous import save_config
 from PLRNet.utils.metric_logger import MetricLogger
 from PLRNet.utils.metrics.cIoU import calc_IoU
+from PLRNet.utils.polygon import get_pred_junctions
+from scipy.spatial.distance import cdist
 
 import torch
 torch.multiprocessing.set_sharing_strategy('file_system')
+
+RECALL_THRESHOLDS = [3, 5, 8]  # pixels
+
+
+def compute_junction_recall(gt_polys, pred_juncs, thresholds=RECALL_THRESHOLDS):
+    """Fraction of GT polygon corners matched within T pixels by pred_juncs."""
+    all_gt = []
+    for poly in gt_polys:
+        pts = np.array(poly).reshape(-1, 2)
+        if len(pts) > 1 and np.allclose(pts[0], pts[-1], atol=0.5):
+            pts = pts[:-1]
+        all_gt.append(pts)
+    if not all_gt:
+        return {t: float('nan') for t in thresholds}
+    gt_corners = np.vstack(all_gt)
+    if len(pred_juncs) == 0:
+        return {t: 0.0 for t in thresholds}
+    min_dists = cdist(gt_corners, pred_juncs).min(axis=1)
+    return {t: float((min_dists <= t).mean()) for t in thresholds}
 
 # ------------------------------------------------------------------ #
 #  Constants
@@ -79,6 +100,7 @@ def init_metrics_csv(csv_path, loss_names):
         + ['val_loss']
         + ['val_w_' + k for k in loss_names]
         + ['val_mask_iou']
+        + [f'val_junc_recall@{t}px' for t in RECALL_THRESHOLDS]
     )
     with open(csv_path, 'w', newline='') as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
@@ -119,7 +141,10 @@ def draw_polygons(ax, polys, color, label):
 #  visualization 
 # ------------------------------------------------------------------ #
 def _render_viz(img_disp, gt_polys, pred_polys, epoch, img_name, viz_dir, split):
-    """Save one GT | Pred side-by-side figure."""
+    """Save one GT | Pred side-by-side figure.
+    Filename : {epoch}_{img_name}.png  (no zero-padding)
+    Titles   : GT_{split}_{epoch}_{img_name}  /  PRED_{split}_{epoch}_{img_name}
+    """
     fig, axes = plt.subplots(1, 2, figsize=(8, 4), dpi=150)
     fig.patch.set_facecolor('black')
     for ax in axes:
@@ -129,24 +154,27 @@ def _render_viz(img_disp, gt_polys, pred_polys, epoch, img_name, viz_dir, split)
         draw_polygons(axes[0], gt_polys,   '#00ff00', 'GT'),
         draw_polygons(axes[1], pred_polys, '#ff6600', 'Pred'),
     ]
-    short_name = img_name[-40:] if len(img_name) > 40 else img_name
-    axes[0].set_title(f"[{split}] GT  |  epoch {epoch:03d}\n{short_name}",
-                      color='white', fontsize=7)
-    axes[1].set_title(f"[{split}] Pred  |  epoch {epoch:03d}\n{short_name}",
-                      color='white', fontsize=7)
+    axes[0].set_title(f"GT_{split}_{epoch}_{img_name}", color='white', fontsize=7)
+    axes[1].set_title(f"PRED_{split}_{epoch}_{img_name}", color='white', fontsize=7)
     axes[1].legend(handles=patches, loc='upper right', fontsize=6, framealpha=0.5)
     plt.tight_layout(pad=0.3)
-    plt.savefig(os.path.join(viz_dir, f"{epoch:03d}_{img_name}.png"),
+    plt.savefig(os.path.join(viz_dir, f"{epoch}_{img_name}.png"),
                 bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
-def _pick_dense_sparse_ids(coco_obj):
-    """Return (dense_img_id, sparse_img_id) using only the COCO annotation index."""
+def _pick_dense_sparse_ids(coco_obj, min_anns=10):
+    """Return (dense_img_id, sparse_img_id) using only the COCO annotation index.
+    Both patches are guaranteed to have >= min_anns annotations (real agricultural content).
+    """
     img_ids = sorted(coco_obj.getImgIds())
     counts  = {iid: len(coco_obj.getAnnIds(imgIds=[iid])) for iid in img_ids}
-    dense_id  = max(counts, key=counts.get)
-    sparse_id = min((iid for iid in img_ids if counts[iid] > 0), key=counts.get)
+    # keep only patches with enough parcels to be visually meaningful
+    valid   = [iid for iid in img_ids if counts[iid] >= min_anns]
+    if not valid:
+        valid = [iid for iid in img_ids if counts[iid] > 0]
+    dense_id  = max(valid, key=counts.get)
+    sparse_id = min(valid, key=counts.get)
     return dense_id, sparse_id
 
 
@@ -268,39 +296,82 @@ def visualize_train(model, train_viz_entries, epoch, output_dir, mean, std):
 @torch.no_grad()
 def validate(model, val_loader, loss_reducer, device, loss_names):
     model.eval()
-    sums  = {k: 0.0 for k in loss_names}
-    total = 0.0
-    iou_sum = 0.0  # accumulate IoU over all images
-    n     = 0
-    
+    sums    = {k: 0.0 for k in loss_names}
+    total   = 0.0
+    iou_sum = 0.0
+    n_loss  = 0
+    n_iou   = 0
+
+    # junction recall: we measure this directly from the raw heatmap,
+    # no polygon post-processing needed
+    recall_sums = {t: 0.0 for t in RECALL_THRESHOLDS}
+    n_recall    = 0
+
     for images, annotations in val_loader:
         images      = images.to(device)
         annotations = to_single_device(annotations, device)
 
-        # forward pass (extras contains refined mask logits)
         loss_dict, extras = model.forward_train(images, annotations)
 
         weighted = loss_reducer(loss_dict)
         for k in loss_names:
             sums[k] += loss_dict[k].item()
-        total += weighted.item()
+        total  += weighted.item()
+        n_loss += images.size(0)
 
-        # per‑image IoU inside the batch
         remask  = extras['remask_pred'].sigmoid()
         mask_gt = torch.stack([a['mask'].squeeze() for a in annotations]).to(device)
 
         for b in range(remask.size(0)):
             pred_bin = (remask[b] > 0.5).cpu().numpy()
             gt_bin   = (mask_gt[b] > 0.5).cpu().numpy()
+            if gt_bin.sum() == 0:
+                continue
             iou_sum += calc_IoU(pred_bin, gt_bin)
+            n_iou   += 1
 
-        n += remask.size(0)    # count images, not batches
+        # get jloc and joff from the network heads (no polygon building)
+        jloc_pred_batch, joff_pred_batch = _get_jloc_joff(model, images)
 
-    # compute averages after all batches
-    avg       = {k: sums[k] / max(n, 1) for k in loss_names}
-    avg_total = total / max(n, 1)
-    avg_iou   = iou_sum / max(n, 1)    # mean IoU over all images
-    return avg_total, avg, avg_iou
+        for b in range(images.size(0)):
+            ann     = annotations[b]
+            gt_juncs = ann.get('junctions', None)
+            if gt_juncs is None or len(gt_juncs) == 0:
+                continue
+            gt_pts = gt_juncs.cpu().numpy()  # (N, 2) pixel coords
+
+            # === CHANGED: binary heatmap (1 channel), same map for concave and convex
+            jloc_concave = jloc_pred_batch[b:b+1, 0:1]
+            jloc_convex  = jloc_pred_batch[b:b+1, 0:1]
+            joff         = joff_pred_batch[b]
+            pred_juncs   = get_pred_junctions(jloc_concave[0], jloc_convex[0], joff)
+
+            if len(pred_juncs) == 0:
+                for t in RECALL_THRESHOLDS:
+                    recall_sums[t] += 0.0
+            else:
+                min_dists = cdist(gt_pts, pred_juncs).min(axis=1)
+                for t in RECALL_THRESHOLDS:
+                    recall_sums[t] += float((min_dists <= t).mean())
+            n_recall += 1
+
+    avg        = {k: sums[k] / max(n_loss, 1) for k in loss_names}
+    avg_total  = total   / max(n_loss, 1)
+    avg_iou    = iou_sum / max(n_iou,  1)
+    avg_recall = {t: recall_sums[t] / max(n_recall, 1) for t in RECALL_THRESHOLDS}
+    return avg_total, avg, avg_iou, avg_recall
+
+
+def _get_jloc_joff(model, images):
+    """Run only the junction heads — skip mask branch and polygon generation."""
+    outputs, features = model.backbone(images)
+    jloc_feature     = model.jloc_head(features)
+    afm_feature      = model.afm_head(features)
+    jloc_att_feature = model.a2j_att(jloc_feature, jloc_feature + afm_feature)
+    # === CHANGED: sigmoid on 1-channel binary heatmap instead of softmax over 3 classes
+    jloc_pred        = model.jloc_predictor(jloc_att_feature).sigmoid()   # (B, 1, H, W)
+    joff_pred        = outputs[:, :].sigmoid() - 0.5                       # (B, 2, H, W)
+    return jloc_pred, joff_pred
 
 
 # ------------------------------------------------------------------ #
@@ -427,13 +498,14 @@ def train(cfg, output_dir, val_every):
         save_checkpoint('latest.pth', epoch)
 
         # --- validation + visualizations every val_every epochs ---
-        val_total  = float('nan')
-        val_losses = {k: float('nan') for k in loss_names}
-        val_iou    = float('nan')
+        val_total       = float('nan')
+        val_losses      = {k: float('nan') for k in loss_names}
+        val_iou         = float('nan')
+        val_junc_recall = {t: float('nan') for t in RECALL_THRESHOLDS}
 
         if epoch % val_every == 0:
             logger.info(f"=== Validation at epoch {epoch} ===")
-            val_total, val_losses, val_iou = validate(
+            val_total, val_losses, val_iou, val_junc_recall = validate(
                 model, val_dataset, loss_reducer, device, loss_names)
             logger.info(
                 "Val total_loss: {:.4f}  |  {}".format(
@@ -442,6 +514,12 @@ def train(cfg, output_dir, val_every):
                 )
             )
             logger.info(f"Val mask_iou: {val_iou:.4f}")
+            # junction recall: fraction of GT corners matched within T pixels
+            # measured on raw jloc heatmap, no polygon post-processing
+            recall_str = "  ".join(
+                f"R@{t}px={val_junc_recall[t]:.4f}" for t in RECALL_THRESHOLDS
+            )
+            logger.info(f"Val junction_recall — {recall_str}")
             # checkpoint at this val epoch
             save_checkpoint(f'epoch_{epoch}.pth', epoch)
 
@@ -465,6 +543,9 @@ def train(cfg, output_dir, val_every):
             row['val_w_' + k] = (round(val_losses[k] * loss_weights[k], 6)
                                  if not np.isnan(val_losses[k]) else '')
         row['val_mask_iou'] = round(val_iou, 6) if epoch % val_every == 0 else ''
+        for t in RECALL_THRESHOLDS:
+            v = val_junc_recall[t]
+            row[f'val_junc_recall@{t}px'] = round(v, 6) if (epoch % val_every == 0 and not np.isnan(v)) else ''
         append_metrics_csv(csv_path, fieldnames, row)
 
         logger.info(

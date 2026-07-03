@@ -2,7 +2,7 @@ SOLVER:
   IMS_PER_BATCH: 8
   BASE_LR: 1e-4
   MAX_EPOCH: 150
-  STEPS: (25,)   
+  STEPS: (25,)
   WEIGHT_DECAY: 0.0001
   CHECKPOINT_PERIOD: 1
   OPTIMIZER: "ADAM"
@@ -24,23 +24,21 @@ DATASETS:
   ORIGIN:
     HEIGHT: 256
     WIDTH: 256
-  ROTATE_F: True   # enable full D4 augmentation (flips + 90/270 rotations)
+  ROTATE_F: True
   TRAIN: ("nl_brp_train",)
   TEST: ("nl_brp_val",)
-
 
 MODEL:
   NAME: "BsiNet_2"
   HEAD_SIZE: [[2]]
   OUT_FEATURE_CHANNELS: 64
   LOSS_WEIGHTS:
-    loss_joff: 0.25     
-    loss_jloc: 4.0      # reduced from 8.0
+    loss_joff: 0.25
+    loss_jloc: 4.0
     loss_mask: 1.0
     loss_afm : 0.1
     loss_remask : 1.0
-  # pos_weight for BCEWithLogitsLoss on binary jloc heatmap
-  # corner pixels ~0.5% of image, pos_weight=50 upweights them vs background
   JLOC_POS_WEIGHT: 50.0
+  ACTIVE_BRANCH: "point"
 
-OUTPUT_DIR: "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp"
+OUTPUT_DIR: "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp_indep"

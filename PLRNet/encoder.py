@@ -25,7 +25,10 @@ class Encoder(object):
         device = junctions.device
         height, width = ann['height'], ann['width']
         junc_tag = ann['juncs_tag'].long()
-        jmap = torch.zeros((height, width), device=device, dtype=torch.long)
+        # === CHANGED: jmap is now float binary (0.0 or 1.0) instead of int 3-class (0/1/2)
+        # The article uses BCE loss on a binary heatmap, not CrossEntropy on 3 classes.
+        # We still keep junc_tag in the encoder for joff masking but jmap only marks "is corner here"
+        jmap = torch.zeros((height, width), device=device, dtype=torch.float32)
         joff = torch.zeros((2, height, width), device=device, dtype=torch.float32)
         edges_positive = ann['edges_positive']
         if len(edges_positive) == 0:
@@ -37,7 +40,8 @@ class Encoder(object):
         xint, yint = junctions[:,0].long(), junctions[:,1].long()
         off_x = junctions[:,0] - xint.float()-0.5
         off_y = junctions[:,1] - yint.float()-0.5
-        jmap[yint, xint] = junc_tag
+        # mark all corners as 1.0 regardless of concave/convex type
+        jmap[yint, xint] = (junc_tag > 0).float()
         joff[0, yint, xint] = off_x
         joff[1, yint, xint] = off_y
         meta = {

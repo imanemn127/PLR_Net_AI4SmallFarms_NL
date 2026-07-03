@@ -78,7 +78,13 @@ class BuildingDetector(nn.Module):
 
         self.backbone = build_backbone(cfg)
         self.backbone_name = cfg.MODEL.NAME
-        self.junc_loss = nn.CrossEntropyLoss()
+
+        # === CHANGED: BCE binary loss instead of CrossEntropy 3-class
+        # The article uses BCE on a binary heatmap (0=background, 1=any corner).
+        # pos_weight upweights corner pixels to handle the ~99.8% background imbalance.
+        self.junc_loss = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([cfg.MODEL.JLOC_POS_WEIGHT])
+        )
 
         self.test_inria = 'inria' in cfg.DATASETS.TEST[0]
         # self.test_inria = 'inria' not in cfg.DATASETS.TEST[0]
@@ -102,7 +108,8 @@ class BuildingDetector(nn.Module):
         self.a2j_att = RSCSEModule(dim_in, 4)
 
         self.mask_predictor = self._make_predictor(dim_in, 2)
-        self.jloc_predictor = self._make_predictor(dim_in, 3)
+        # === CHANGED: 1 output channel (binary heatmap) instead of 3 (3-class)
+        self.jloc_predictor = self._make_predictor(dim_in, 1)
         self.afm_predictor = self._make_predictor(dim_in, 2)
 
         self.refuse_conv = RAMAttention(2, dim_in // 2, dim_in, 4)
@@ -131,23 +138,24 @@ class BuildingDetector(nn.Module):
         jloc_att_feature = self.a2j_att(jloc_feature, jloc_feature + afm_feature)
 
         mask_pred   = self.mask_predictor(mask_att_feature)  # (B,2,H,W) logits
-        jloc_pred   = self.jloc_predictor(jloc_att_feature) # (B,3,H,W) logits
+        jloc_pred   = self.jloc_predictor(jloc_att_feature) # (B,1,H,W) logits
         afm_pred    = self.afm_predictor(afm_feature)        # (B,2,H,W)
         afm_conv    = self.refuse_conv(afm_pred)
         remask_pred = self.final_conv(features + afm_conv)   # (B,2,H,W) logits
         joff_pred   = outputs[:, :].sigmoid() - 0.5         # (B,2,H,W) in [-0.5, 0.5]
 
         # targets — enforce dtypes expected by each loss
-        jloc_gt  = targets['jloc'].squeeze(1).long()         # (B,H,W) int64
+        jloc_gt  = targets['jloc'].squeeze(1).float()        # (B,H,W) float32 binary {0,1}
         joff_gt  = targets['joff']                           # (B,2,H,W) float32
         mask_gt  = targets['mask'].squeeze(1).float()        # (B,H,W) float32 in [0,1]
         afmap_gt = targets['afmap']                          # (B,2,H,W) float32
 
-        # loss_jloc : cross-entropy over 3 classes (0=bg, 1=concave, 2=convex)
-        loss_jloc = self.junc_loss(jloc_pred, jloc_gt)
+        # === CHANGED: BCE binary loss on jloc (article eq.6 applied to point heatmap)
+        self.junc_loss.pos_weight = self.junc_loss.pos_weight.to(device)
+        loss_jloc = self.junc_loss(jloc_pred.squeeze(1), jloc_gt)
 
         # loss_joff : L1 restricted to pixels that have a junction
-        junc_mask = (jloc_gt > 0).float().unsqueeze(1)      # (B,1,H,W)
+        junc_mask = jloc_gt.unsqueeze(1)                    # (B,1,H,W) already binary float
         loss_joff = F.l1_loss(joff_pred * junc_mask,
                               joff_gt  * junc_mask,
                               reduction='sum') / (junc_mask.sum() + 1e-6)
@@ -199,9 +207,11 @@ class BuildingDetector(nn.Module):
 
         # mask_pred = mask_pred.softmax(1)
 
-        jloc_convex_pred = jloc_pred.softmax(1)[:, 2:3]
-
-        jloc_concave_pred = jloc_pred.softmax(1)[:, 1:2]
+        # === CHANGED: 1-channel binary heatmap, sigmoid instead of softmax over 3 classes
+        # Both concave and convex pred point to the same sigmoid map (no class distinction in loss)
+        jloc_prob = jloc_pred.sigmoid()          # (B,1,H,W)
+        jloc_convex_pred  = jloc_prob            # (B,1,H,W)
+        jloc_concave_pred = jloc_prob            # (B,1,H,W)
 
         # remask_pred = mask_pred
         remask_pred = remask_pred.softmax(1)[:, 1:]
