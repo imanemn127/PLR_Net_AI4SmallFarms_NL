@@ -6,7 +6,7 @@ Computes all metrics from Table 10 of the article:
   APpoly / ARpoly   : COCO polygon AP/AR (segmentation)
   APbound / ARbound : Boundary IoU AP/AR
   PoLiS             : Polygon similarity metric
-  IoU               : Mean binary mask IoU
+  IoU               : Pixel IoU on rasterised polygons (post-processing)
 
 Inspired by:
   - eval_testA.py         : inference loop, image loading, IoU/junction recall
@@ -160,6 +160,8 @@ def main():
     parser.add_argument("--split",      default="test", choices=["test", "val"],
                         help="Which COCO split to evaluate on")
     parser.add_argument("--output",     default="/home/imane/DATA/PLR-Net_output/eval_full/nl")
+    parser.add_argument("--skip-nodata", action="store_true",
+                        help="Skip patches where >50%% of pixels are NaN (NoData)")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -192,7 +194,7 @@ def main():
 
     # ---- Inference loop ----------------------------------------------------
     coco_poly_results = []   # polygon detections → saved as JSON for COCO eval
-    iou_list          = []   # per-image mask IoU
+    iou_poly_list     = []   # per-image IoU on rasterised polygons (post-processing)
     recall_lists      = {t: [] for t in RECALL_THRESHOLDS}
     polis_list        = []   # per matched GT-pred pair
 
@@ -205,6 +207,12 @@ def main():
             print(f"  [SKIP] {img_path}")
             continue
 
+        if args.skip_nodata:
+            with rasterio.open(img_path) as _src:
+                _arr = _src.read(1).astype(np.float32)
+            if np.isnan(_arr).mean() > 0.5:
+                continue
+
         tensor = load_image(img_path, cfg).to(device)
 
         with torch.no_grad():
@@ -214,10 +222,7 @@ def main():
         juncs      = output['juncs_pred'][0]          # (N,2) junction coords
         pred_polys = output['polys_pred'][0] if output['polys_pred'] else []
 
-        # --- Mask IoU (binary, no post-processing) --------------------------
-        gt_mask  = build_gt_mask(coco_gt, img_id, h, w)
-        pred_bin = (mask_pred > 0.5).astype(np.uint8)
-        iou_list.append(calc_IoU(pred_bin, gt_mask))
+        # (IoU computed after post-processing, see below)
 
         # --- GT polygon vertices for this image -----------------------------
         gt_anns  = coco_gt.loadAnns(coco_gt.getAnnIds(imgIds=[img_id]))
@@ -315,8 +320,31 @@ def main():
     # ---- PoLiS -------------------------------------------------------------
     polis_mean = float(np.mean(polis_list)) if polis_list else float('nan')
 
-    # ---- Mask IoU ----------------------------------------------------------
-    mean_iou = float(np.mean(iou_list)) * 100 if iou_list else float('nan')
+    # ---- IoU on rasterised polygons (post-processing) — matches article ----
+    # Rasterise predicted polygons from dt_file, compare pixel-by-pixel to GT.
+    # Equivalent to compute_IoU_cIoU in PLRNet/utils/metrics/cIoU.py.
+    from pycocotools import mask as cocomask
+    iou_poly_list = []
+    if coco_poly_results:
+        coco_gti = COCO(ann_file)
+        coco_dtp = coco_gti.loadRes(dt_file)
+        for _img_id in coco_gti.getImgIds():
+            _info = coco_gti.loadImgs(_img_id)[0]
+            _h, _w = _info['height'], _info['width']
+            # predicted mask from polygons
+            _pred = np.zeros((_h, _w), dtype=bool)
+            for _ann in coco_dtp.loadAnns(coco_dtp.getAnnIds(imgIds=[_img_id])):
+                _rle = cocomask.frPyObjects(_ann['segmentation'], _h, _w)
+                _pred |= cocomask.decode(_rle).reshape(_h, _w).astype(bool)
+            # GT mask from polygons
+            _gt = np.zeros((_h, _w), dtype=bool)
+            for _ann in coco_gti.loadAnns(coco_gti.getAnnIds(imgIds=[_img_id])):
+                _rle = cocomask.frPyObjects(_ann['segmentation'], _h, _w)
+                _gt |= cocomask.decode(_rle).reshape(_h, _w).astype(bool)
+            if _gt.sum() == 0 and _pred.sum() == 0:
+                continue
+            iou_poly_list.append(calc_IoU(_pred, _gt))
+    mean_iou = float(np.mean(iou_poly_list)) * 100 if iou_poly_list else float('nan')
 
     # ---- Junction recall averages ------------------------------------------
     jr = {t: float(np.mean(recall_lists[t])) if recall_lists[t] else float('nan')
@@ -333,12 +361,12 @@ def main():
     print(f"{'APbound (%)':<22} {ap_bound:>10.1f}  {'41.5':>18}")
     print(f"{'ARbound (%)':<22} {ar_bound:>10.1f}  {'53.1':>18}")
     print(f"{'PoLiS':<22} {polis_mean:>10.3f}  {'1.51':>18}")
-    print(f"{'IoU mask (%)':<22} {mean_iou:>10.2f}  {'75.86':>18}")
+    print(f"{'IoU region (%)':<22} {mean_iou:>10.2f}  {'75.86':>18}")
     print("-" * 54)
     print(f"{'Junction R@3px':<22} {jr[3]:>10.4f}")
     print(f"{'Junction R@5px':<22} {jr[5]:>10.4f}")
     print(f"{'Junction R@8px':<22} {jr[8]:>10.4f}")
-    print(f"{'Images evaluated':<22} {len(iou_list):>10}")
+    print(f"{'Images evaluated':<22} {len(iou_poly_list):>10}")
     print("=" * 60)
 
     # ---- Save JSON summary -------------------------------------------------
@@ -346,13 +374,13 @@ def main():
         "checkpoint": args.checkpoint,
         "epoch": epoch,
         "split": args.split,
-        "n_images": len(iou_list),
+        "n_images": len(iou_poly_list),
         "APpoly":   ap_poly,
         "ARpoly":   ar_poly,
         "APbound":  ap_bound,
         "ARbound":  ar_bound,
         "polis":    polis_mean,
-        "iou_mask_pct": mean_iou,
+        "iou_region_pct": mean_iou,
         "junction_recall": {f"@{t}px": jr[t] for t in RECALL_THRESHOLDS},
         "article_table10_PLRNet": {
             "APpoly": 47.1, "ARpoly": 55.5,

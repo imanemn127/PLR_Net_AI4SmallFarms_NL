@@ -30,7 +30,7 @@ COLORS = {
 
 def find_latest_run():
     """Return the most recent timestamped run folder that contains a metrics.csv."""
-    base    = "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp"
+    base    = "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp_indep"
     pattern = os.path.join(base, "*/metrics.csv")
     runs    = sorted(glob.glob(pattern))
     if not runs:
@@ -74,12 +74,19 @@ def main():
 
     val_df = df.dropna(subset=["val_loss"])
 
-    # -------- layout: 4 subplots --------
+    # parse junction recall columns (present only from run 5 onwards)
+    recall_cols = {t: f"val_junc_recall@{t}px" for t in [3, 5, 8]}
+    for col in recall_cols.values():
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # -------- layout: 5 subplots --------
     #   [0] Total loss (train vs val)
     #   [1] Individual train losses
     #   [2] Individual val losses (at validation epochs only)
     #   [3] Val mask IoU
-    fig, axes = plt.subplots(1, 4, figsize=(24, 5))
+    #   [4] Junction recall @ 3 / 5 / 8 px
+    fig, axes = plt.subplots(1, 5, figsize=(30, 5))
 
     # --- subplot 0 : total loss train vs val ---
     ax = axes[0]
@@ -153,6 +160,31 @@ def main():
     ax.set_xlabel("Epoch")
     ax.set_ylabel("IoU")
     ax.set_title("Mask IoU (train vs val)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # --- subplot 4 : junction recall @ 3 / 5 / 8 px ---
+    ax = axes[4]
+    recall_colors = {3: "#d62728", 5: "#ff7f0e", 8: "#9467bd"}
+    has_recall = False
+    for t, col in recall_cols.items():
+        if col in df.columns:
+            sub = df.dropna(subset=[col])
+            if len(sub):
+                ax.plot(sub["epoch"], sub[col],
+                        color=recall_colors[t], linewidth=1.4,
+                        marker="o", markersize=4, label=f"R@{t}px")
+                has_recall = True
+    if has_recall:
+        ax.set_ylim(0, 1)
+        ax.axhline(0.5, color="grey", linewidth=0.8, linestyle="--", alpha=0.5)
+    else:
+        ax.text(0.5, 0.5, "No recall data yet\n(available from run 5)",
+                ha="center", va="center", transform=ax.transAxes,
+                color="grey", fontsize=9)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Recall")
+    ax.set_title("Junction Recall (val, raw heatmap)")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
