@@ -31,27 +31,23 @@ PATCHES_DIR = os.path.join(DATA_NL, "patches")
 PATCH_SIZE = 256   # pixels
 STRIDE     = 205   # 256 * 0.8 ≈ 205 px  →  ~20% overlap
 
+# ---- Quality filters --------------------------------------------------------
+# Skip patches where too many pixels are NoData (sea, mosaic border, Wadden islands).
+MAX_NAN_FRAC = 0.30   # skip if >30% of band-1 pixels are NaN
 
 # ---- Zone definitions (EPSG:28992, metres) ----------------------------------
 # Format: (xmin, ymin, xmax, ymax)
-#
-# Zones sized to match article Table 1 patch counts:
-#   Train: 6940 patches (2 zones, 55x64 + 59x58 strides → 3520+3422=6942)
-#   Test:  1504 patches (1 zone, 35x43 strides → 1505)
-# stride=205 px, patch=256 px (20% overlap)
-# No overlap between zones; all within NL mosaic extent.
+# Zones inspired by Figure 1 of the article.
+# Final patch counts depend on quality filters above (NaN + BRP coverage).
 ZONES = {
     "test": [
-        # yellow box — Friesland (NORTH)
-        # 35x43 stride grid → 1505 patches (72.3km x 88.7km)
-        (133870, 535340, 206130, 624000),
+        # Friesland interior
+        (156886, 540284, 228886, 608817),
     ],
     "train": [
-        # red box 1 — Flevoland / Gelderland / Overijssel (central-east)
-        # 55x64 stride grid → 3520 patches (113.3km x 131.7km)
+        # Flevoland / Gelderland / Overijssel (central-east)
         (148000, 386290, 261260, 518000),
-        # red box 2 — Zuid-Holland / Utrecht / Noord-Brabant (central-west)
-        # 59x58 stride grid → 3422 patches (121.5km x 119.4km)
+        # Zuid-Holland / Utrecht / Noord-Brabant (central-west)
         (26540, 360590, 148000, 480000),
     ]
 }
@@ -104,6 +100,11 @@ def extract_patches():
                         # Read image (4 bands: B2, B3, B4, B8) and label
                         img_patch = src_img.read(window=win)       # (4, 256, 256)
                         lbl_patch = src_lbl.read(1, window=win)    # (256, 256)
+
+                        # Skip patches that are mostly NoData (sea, mosaic border)
+                        nan_frac = np.isnan(img_patch[0].astype(np.float32)).mean()
+                        if nan_frac > MAX_NAN_FRAC:
+                            continue
 
                         name = f"NL_{split}_z{z_idx+1}_r{row:06d}_c{col:06d}"
 
