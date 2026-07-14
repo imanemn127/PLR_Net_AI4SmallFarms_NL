@@ -567,3 +567,271 @@ the vertex level, and APpoly stays near 0.
 A fix would require building GT junctions directly from the BRP vector geometry (no
 raster→vector round-trip) and filtering collinear vertices with a minimum angle threshold.
 This is left as future work.
+
+---
+
+## Raster GT Pipeline (region/line/point isolated on GeoTIFF targets)
+
+Following the diagnosis above, the tutor asked to rebuild GT for each branch directly
+from the BRP vector (no `rasterio.shapes` round-trip) and train the 3 branches
+independently against these rasters instead of COCO. This starts a new run numbering
+(`Run1`, `Run2`, ...), separate from the COCO-pipeline runs above (NL1–NL8).
+
+### `build_gt_rasters_from_brp.py`
+
+New script (`data_nl/build_gt_rasters_from_brp.py`), independent from the step1–5 chain
+above. For every patch already extracted by step3, it clips the BRP GeoPackage to the
+patch bounding box and rasterizes 3 targets on the exact same grid/CRS/transform as
+`images/`:
+
+- `gt_region/<stem>.tif` — binary parcel mask, rasterized directly from BRP polygons
+  (no per-instance mask addition, so adjacent parcels are not merged — fixes the
+  `seg_mask += annToMask()` bug in `train_dataset.py`)
+- `gt_lines/<stem>.tif` — 1px-thin boundary map (polygon rings → LineStrings →
+  `rasterize(all_touched=True)`)
+- `gt_nodes/<stem>.tif` — real BRP vertices, filtered by interior angle: a vertex is
+  kept only if it deviates from 180° (straight line) by more than 10°, removing
+  collinear vertices along straight edges
+
+```bash
+/mnt/DATA/IMANE/ai4sf/bin/python data_nl/build_gt_rasters_from_brp.py --split all
+```
+
+**Corner count check** on patch `NL_train_z1_r000000_c002460`: old GT (COCO/`rasterio.shapes`)
+had 2,486 corner pixels; new GT (angle-filtered) has 490 — an 80% reduction, consistent
+with the GT corruption diagnosed above.
+
+### Dataset / model changes
+
+- `PLRNet/dataset/train_dataset.py` — new `RasterGTDataset` + `collate_fn_raster`: loads
+  `(image, GT raster)` pairs from `images/` + `gt_region|gt_lines|gt_nodes/`, respects the
+  existing `train.txt`/`val.txt` split via `stems_file`. `augment=False` fully disables
+  flip/rotate for validation (the previous `rotate_f=False` alone still applied a random
+  flip — not truly deterministic).
+- `PLRNet/dataset/build.py` — new `build_train_dataset_raster(cfg, root, stems_file, is_val)`.
+- `PLRNet/detector.py` — merged the `ACTIVE_BRANCH` mechanism (previously only in an
+  unused `detector_branch_isolation_backup.py`) into the active file. When
+  `ACTIVE_BRANCH != "all"`, SCE cross-attention is disabled and only the active branch's
+  loss is computed. Raster-mode targets are built directly from the GT rasters
+  (`_targets_from_rasters`), skipping the COCO `Encoder`.
+  - **Isolation fix**: `remask_pred` (region branch) is computed via
+    `afm_predictor → refuse_conv → final_conv`, so it is never independent from the line
+    branch weights. In isolated `"region"` mode, `loss_remask` is now skipped — only
+    `loss_mask` (from `mask_predictor`, a fully dedicated head) is used.
+  - **New head**: `line_predictor` (1 channel, BCE) added for isolated line-branch
+    training against the thin binary `gt_lines`, since `afm_predictor` (2 channels) is
+    built for a continuous vector field, not a binary target. *(Superseded in the
+    AFM-raster experiment below — see "Open question".)*
+- `scripts/train.py` — new `train_raster()` / `validate_raster()`: training/validation
+  loop for isolated-branch runs, dispatched automatically from `ACTIVE_BRANCH` in the
+  yaml. Validation metric: IoU for region, precision/recall for line/point (a sparse GT
+  like corners makes IoU uninformative).
+- `scripts/plot_losses_raster.py`, `scripts/inspect_branch_raster.py` — dedicated
+  plotting/visualization scripts for isolated-branch runs (separate from the COCO/`"all"`
+  scripts, different CSV format and no polygon GT to draw).
+- New yaml configs: `PLR-Net_branch_region.yaml`, `PLR-Net_branch_line.yaml`,
+  `PLR-Net_branch_point.yaml`, `PLR-Net_branch_point_sce.yaml` — `OUTPUT_DIR` under
+  `nl_brp_raster/<branch>/`.
+
+---
+
+### Run1 — Branch line isolated, raster GT (80 epochs, stopped)
+
+Config: `PLR-Net_branch_line.yaml`, `ACTIVE_BRANCH="line"`, `JLOC_POS_WEIGHT=50`.
+`line_predictor` (1ch, BCE) against `gt_lines`.
+
+| Loss (weighted) | Train (ep 1 → 80) | Val (ep 5 → 80) |
+|------|-------------------|-----------------|
+| `w_loss_afm` (= line_predictor BCE) | 0.036 → 0.023 | 0.0035 → 0.0029 |
+| val precision | — | 0.643 (ep 5) → 0.735 (ep 80) |
+| val recall | — | 0.485 (ep 5) → 0.567 (ep 80) |
+
+**Diagnosis:** Good result — precision/recall both stable and reasonable (~0.70/0.55 in the
+40–80 epoch range), visually the predicted contour map closely follows the true parcel
+boundaries. The line branch is not where the pipeline fails.
+
+---
+
+### Run2 — Branch point isolated, raster GT, `pos_weight=50` (95 epochs, stopped)
+
+Config: `PLR-Net_branch_point.yaml`, `ACTIVE_BRANCH="point"`, `JLOC_POS_WEIGHT=50`
+(original article default).
+
+| Loss (weighted) | Train (ep 1 → 95) | Val (ep 5 → 95) |
+|------|-------------------|-----------------|
+| `w_loss_jloc` | 2.998 → 2.261 | 0.368 → 0.316 |
+| val precision | — | 0.069 (ep 5) → 0.088 (ep 95) |
+| val recall | — | 0.823 (ep 5) → 0.856 (ep 95) |
+
+**Diagnosis:** Severe over-detection — precision stuck near 0.07–0.09 while recall stays
+high (~0.85). Visually, the predicted "point" heatmap looks almost identical to the line
+branch's contour map: the network learned "close to a boundary" instead of "is a real
+corner".
+
+Follow-up check: the true neg/pos pixel ratio on `gt_nodes` was measured at 65 (500-patch
+sample) / 59.2 (full 4,608-patch set) — close enough to the default 50 that
+`JLOC_POS_WEIGHT` was not considered the likely cause of the imbalance below, but tested
+anyway in Run3.
+
+---
+
+### Run3 — Branch point isolated, `pos_weight=150` (15 epochs, stopped early)
+
+Same config, `JLOC_POS_WEIGHT` pushed to 150 to test whether a more aggressive class
+rebalancing improves precision.
+
+| Epoch | val precision | val recall |
+|-------|---------------|------------|
+| 5 | 0.036 | 0.965 |
+| 10 | 0.045 | 0.944 |
+| 15 | 0.047 | 0.948 |
+
+**Diagnosis:** Recall goes up, precision goes down further — the classic trade-off curve,
+confirmed empirically. `pos_weight` only moves the precision/recall operating point; it
+does not give the network a new ability to distinguish a corner from a straight edge.
+`JLOC_POS_WEIGHT` reset to the original **50** in `PLR-Net_branch_point.yaml` — not the
+right lever for this problem.
+
+---
+
+### Run4 — Branch point + frozen line SCE guidance ("point_sce"), 150 epochs, complete
+
+Hypothesis: without SCE, the point branch has no information about parcel boundaries.
+New `ACTIVE_BRANCH="point_sce"` mode (`config-files/PLR-Net_branch_point_sce.yaml`,
+`JLOC_POS_WEIGHT=65` at the time of this run — later reset to 50, see Run3 conclusion):
+SCE cross-attention (`a2j_att`) is re-enabled for jloc (as in `"all"` mode), guided by
+`afm_head` loaded from the Run1 line-branch checkpoint
+(`nl_brp_raster/line/2026-07-09_09-35-31/checkpoints/best_val_loss.pth`) and **frozen**
+(`requires_grad=False`, BatchNorm kept in `eval()` even across `model.train()` calls via
+an overridden `train()` method). Only `jloc_head`/`jloc_predictor`/`a2j_att` keep learning.
+
+| Epoch | val precision | val recall |
+|-------|---------------|------------|
+| 5 | 0.057 | 0.874 |
+| 50 | 0.074 | 0.880 |
+| 100 | 0.079 | 0.870 |
+| 150 | 0.079 | 0.881 |
+
+**Diagnosis:** No meaningful improvement over Run2 (plain isolated point, pos_weight=50:
+precision ~0.07–0.09). Curves plateau by epoch ~20 and stay flat for the rest of the run.
+Visually, `point_sce` predictions are nearly indistinguishable from plain `point`
+predictions — both reproduce the contour network instead of isolated corners. The frozen
+line guidance carries no extra discriminative signal for corner-vs-edge, likely because
+`afm_head` here was trained against a binary contour target (`line_predictor`/BCE), not
+the true continuous vector AFM — so it encodes "near a boundary", the same ambiguous
+signal the point branch already struggles with on its own.
+
+**Conclusion so far:** neither class rebalancing (`pos_weight`) nor frozen-line SCE
+guidance (in its current binary-contour form) explain or fix the point branch's
+over-detection.
+
+---
+
+### Switching the line branch to a real vector AFM (`afm_op`)
+
+Follow-up tutor meeting: revisit the line branch to predict a 2-channel
+**distance/direction field** (dx, dy to the nearest boundary) instead of a direct binary
+map — a continuous signal gives a smoother gradient than a hard 0/1 target, and is closer
+to what the article actually does (`afm_op`, the CUDA operator from the original PLR-Net
+architecture).
+
+Two ways to get this field were considered: approximate it from the raster GT
+(`scipy.ndimage.distance_transform_edt` on `gt_lines`), or reconstruct vector segments
+from the BRP GeoPackage and feed them to the real `afm_op`. The raster approximation was
+rejected — a distance transform on an already-rasterized 1px boundary loses exactly the
+sub-pixel precision needed near corners, which is the part of the pipeline under
+investigation. Decided to reconstruct vector segments instead: `afm_op` itself has no
+dependency on COCO — it only needs a tensor of `(x1,y1,x2,y2)` segments, which can come
+from anywhere, including BRP polygon rings clipped per patch (same clipping already used
+for `gt_lines`/`gt_nodes`).
+
+**Implementation:**
+- `data_nl/build_gt_rasters_from_brp.py` — new `polygons_to_pixel_segments()` (BRP rings →
+  pixel-coordinate segments) and `build_gt_afm()` (calls `afm_op` on those segments),
+  saved as a 4th raster `gt_afm/<stem>.tif` (2 bands). New `--only {region,lines,nodes,afm}`
+  flag so any subset can be (re)computed without touching the others.
+- `RasterGTDataset` — loads `gt_afm` for the line branch; flip/rotate augmentation now
+  also transforms the (dx,dy) vector components themselves (e.g. horizontal flip negates
+  dx), not just the pixel grid — verified against `cv2`'s rotation matrix on a synthetic
+  vector.
+- `detector.py` — `afm_predictor` (2ch, MAE against `gt_afm`) replaces `line_predictor`
+  (1ch, BCE) for the isolated line branch.
+
+**Two bugs found and fixed while validating this end-to-end:**
+1. `validate_raster` applied `sigmoid()` to `branch_pred` unconditionally, but for the
+   line branch `branch_pred` was already a probability — the extra sigmoid flattened it
+   toward 0.5 and silently broke precision/recall for that branch.
+2. More importantly: `afm_op`'s CUDA kernel does not output a raw pixel displacement. It
+   stores `-sign(a)*log(|a|/size + 1e-6)` (see `csrc/lib/afm_op/cuda/afm.cu`). Computing
+   `sqrt(dx²+dy²)` directly on that log-encoded output gives a meaningless quantity — verified
+   concretely: the norm was *larger* on true boundary pixels than off them, the opposite of
+   what an attraction field should look like. Added `afm_to_pixel_offset()` in `detector.py`
+   to invert the transform back to a real pixel displacement before computing any norm or
+   threshold; validated against a synthetic single-segment case (norm ≈ 0 on the segment,
+   growing correctly with true Euclidean distance elsewhere). Training itself (the MAE loss)
+   was never affected by this bug — both sides of the loss live in the same log space — only
+   the post-hoc interpretation (validation metrics, visualization) was wrong.
+
+---
+
+### Run5 — Branch line isolated, real vector AFM via `afm_op` (150 epochs, complete)
+
+Config: `PLR-Net_branch_line.yaml`, `ACTIVE_BRANCH="line"`, `JLOC_POS_WEIGHT=50`.
+`afm_predictor` (2ch) + MAE against `gt_afm` (computed with `afm_op` on BRP polygon edges).
+
+| Epoch | val precision | val recall |
+|-------|---------------|------------|
+| 5 | 0.513 | 0.129 |
+| 25 | 0.500 | 0.421 |
+| 50 | 0.561 | 0.373 |
+| 100 | 0.541 | 0.470 |
+| 150 | 0.551 | 0.486 |
+
+**Diagnosis:** Visually strong — the predicted contour map closely reproduces the true
+parcel network, with sharp, well-localized boundaries (see
+`inspect_branch_raster/line_afm/`). Recall climbs steadily and has not plateaued by epoch
+150 (0.13 → 0.49), unlike Run1 which stabilized earlier. Precision (~0.55) is lower and
+noisier than Run1's BCE approach (~0.70–0.73) at the same point in training — this run
+may not have finished converging.
+
+**Artifact noted:** in large, internally homogeneous parcels (far from any boundary), the
+predicted map shows a spurious regular grid pattern not present in the GT (see
+`NL_train_z2_r010865_c003895.png`). Root cause identified: the raw network output
+(`dx_log`, before the `afm_to_pixel_offset` decoding) oscillates in sign at high spatial
+frequency in these regions — confirmed numerically (adjacent pixels alternating between
+roughly +5 and -6 in log-space). Since sign flips are amplified by the log/exp decoding,
+this creates the visible grid. Likely because the true "direction to nearest boundary" is
+locally ill-defined deep inside a large uniform parcel, so the network has no strong
+signal to anchor a stable direction there. Left unaddressed for now (per decision to avoid
+architecture changes beyond what's necessary) since it does not affect boundary-adjacent
+pixels, which is what matters for the region-splitting use case discussed in the tutor
+meeting.
+
+---
+
+### Run6 — `point_sce` v2 with the real vector-AFM line checkpoint (80+ epochs, ongoing)
+
+Same setup as Run4 (`point_sce`, frozen `afm_head`, `JLOC_POS_WEIGHT=50`), but
+`LINE_CHECKPOINT` now points to Run5
+(`nl_brp_raster/line/2026-07-13_13-53-21/checkpoints/best_val_loss.pth`) — a guide trained
+on the real vector AFM instead of the binary `line_predictor` used in Run4.
+
+| Epoch | val precision | val recall |
+|-------|---------------|------------|
+| 5 | 0.064 | 0.835 |
+| 30 | 0.076 | 0.859 |
+| 55 | 0.076 | 0.875 |
+| 80 | 0.085 | 0.858 |
+
+**Diagnosis:** Same outcome as Run4 — no meaningful improvement over plain isolated
+`point` (Run2: precision ~0.07–0.09, recall ~0.85). This is a second, stronger
+disconfirmation of the SCE-guidance hypothesis: even with a geometrically accurate,
+well-trained AFM guide (Run5's visual quality is good), frozen cross-branch guidance does
+not help the point branch separate corners from generic boundary proximity.
+
+**Working hypothesis going forward:** the common factor across both `point_sce` attempts
+is that `afm_head` was **frozen** — the point branch could only consume a fixed guide, not
+co-adapt with it. The article's own architecture trains all branches jointly with SCE
+active throughout, allowing mutual gradient flow. Next test: joint line+point training
+with SCE active and *not* frozen, to check whether it is this co-adaptation — rather than
+guide quality alone — that the frozen setup was missing.
