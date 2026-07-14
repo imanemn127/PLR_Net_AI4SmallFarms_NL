@@ -10,6 +10,18 @@ from PLRNet.utils.polygon import get_pred_junctions
 from skimage.measure import label, regionprops
 
 
+# -------------------------------------------------------------------
+# ADDED: afm_op stores -sign(a)*log(|a|/size + 1e-6), not a raw pixel
+# offset (see csrc/lib/afm_op/cuda/afm.cu). This inverts it back to
+# a pixel displacement (ax, ay).
+# -------------------------------------------------------------------
+def afm_to_pixel_offset(afm_pred, height, width):
+    dx_log, dy_log = afm_pred[:, 0], afm_pred[:, 1]
+    ax = -torch.sign(dx_log) * width  * torch.exp(-dx_log.abs())
+    ay = -torch.sign(dy_log) * height * torch.exp(-dy_log.abs())
+    return ax, ay
+
+
 class RSCSEModule(nn.Module):
     def __init__(self, in_channels=32, reduction=4):
         super().__init__()
@@ -112,11 +124,45 @@ class BuildingDetector(nn.Module):
         self.jloc_predictor = self._make_predictor(dim_in, 1)
         self.afm_predictor = self._make_predictor(dim_in, 2)
 
+        # === ADDED: dedicated 1-channel binary head for isolated line-branch
+        # training against a thin boundary raster (BCE, same idea as jloc).
+        # Not used in "all"/vector-AFM mode.
+        self.line_predictor = self._make_predictor(dim_in, 1)
+
         self.refuse_conv = RAMAttention(2, dim_in // 2, dim_in, 4)
         # self.final_conv = self._make_conv(dim_in*2, dim_in, 2)
         self.final_conv = self._make_conv(dim_in, dim_in // 2, 2)
 
         self.train_step = 0
+
+        # which branch to train in isolation: "all", "region", "line", "point", "point_sce"
+        self.active_branch = getattr(cfg.MODEL, 'ACTIVE_BRANCH', 'all')
+
+    # -------------------------------------------------------------------
+    # ADDED: for "point_sce" — load afm_head weights from an already
+    # trained line-branch checkpoint and freeze them, so the point branch
+    # gets SCE guidance from a fixed, working boundary feature instead of
+    # a randomly-initialized one.
+    # -------------------------------------------------------------------
+    def load_and_freeze_afm_head(self, line_checkpoint_path, device):
+        ckpt = torch.load(line_checkpoint_path, map_location=device)
+        state = ckpt.get('model', ckpt)
+        afm_head_state = {
+            k[len('afm_head.'):]: v for k, v in state.items() if k.startswith('afm_head.')
+        }
+        self.afm_head.load_state_dict(afm_head_state)
+        for p in self.afm_head.parameters():
+            p.requires_grad = False
+        self._afm_head_frozen = True
+        self.afm_head.eval()
+
+    def train(self, mode=True):
+        # keep afm_head in eval() (frozen BatchNorm stats) even when the
+        # rest of the model is switched to train() every epoch
+        super().train(mode)
+        if getattr(self, '_afm_head_frozen', False):
+            self.afm_head.eval()
+        return self
 
     def forward(self, images, annotations=None):
         if self.training:
@@ -125,8 +171,18 @@ class BuildingDetector(nn.Module):
 
     def forward_train(self, images, annotations):
         device = images.device
-        targets, metas = self.encoder(annotations)
-        targets = {k: v.to(device) for k, v in targets.items()}
+
+        # ---------------------------------------------------------------
+        # ADDED: raster GT path. If the dataset already gives per-branch
+        # GT rasters (RasterGTDataset), skip the COCO Encoder entirely and
+        # build targets straight from the rasters.
+        # ---------------------------------------------------------------
+        is_raster_mode = 'gt_region' in annotations[0]
+        if is_raster_mode:
+            targets = self._targets_from_rasters(annotations, device)
+        else:
+            targets, metas = self.encoder(annotations)
+            targets = {k: v.to(device) for k, v in targets.items()}
 
         outputs, features = self.backbone(images)
 
@@ -134,8 +190,21 @@ class BuildingDetector(nn.Module):
         jloc_feature = self.jloc_head(features)
         afm_feature  = self.afm_head(features)
 
-        mask_att_feature = self.a2m_att(mask_feature, mask_feature + afm_feature)
-        jloc_att_feature = self.a2j_att(jloc_feature, jloc_feature + afm_feature)
+        # === ISOLATED BRANCH MODE ===
+        # When ACTIVE_BRANCH != "all", SCE cross-attention is disabled so each
+        # branch learns only from backbone features with no help from other branches.
+        # "all"      → original full model with SCE (default)
+        # "region"   → mask head only, no AFM guidance
+        # "line"     → afm head only, no cross-branch
+        # "point"    → jloc head only, no AFM guidance
+        # "point_sce"→ jloc head with SCE guidance from a frozen, pre-trained
+        #              afm_head (see train_raster / freeze_afm_head)
+        if self.active_branch == 'all' or self.active_branch == 'point_sce':
+            mask_att_feature = self.a2m_att(mask_feature, mask_feature + afm_feature)
+            jloc_att_feature = self.a2j_att(jloc_feature, jloc_feature + afm_feature)
+        else:
+            mask_att_feature = mask_feature
+            jloc_att_feature = jloc_feature
 
         mask_pred   = self.mask_predictor(mask_att_feature)  # (B,2,H,W) logits
         jloc_pred   = self.jloc_predictor(jloc_att_feature) # (B,1,H,W) logits
@@ -150,24 +219,45 @@ class BuildingDetector(nn.Module):
         mask_gt  = targets['mask'].squeeze(1).float()        # (B,H,W) float32 in [0,1]
         afmap_gt = targets['afmap']                          # (B,2,H,W) float32
 
-        # === CHANGED: BCE binary loss on jloc (article eq.6 applied to point heatmap)
-        self.junc_loss.pos_weight = self.junc_loss.pos_weight.to(device)
-        loss_jloc = self.junc_loss(jloc_pred.squeeze(1), jloc_gt)
+        zero = torch.tensor(0.0, device=device)
 
-        # loss_joff : L1 restricted to pixels that have a junction
-        junc_mask = jloc_gt.unsqueeze(1)                    # (B,1,H,W) already binary float
-        loss_joff = F.l1_loss(joff_pred * junc_mask,
-                              joff_gt  * junc_mask,
-                              reduction='sum') / (junc_mask.sum() + 1e-6)
+        # point branch losses
+        if self.active_branch in ('point', 'point_sce', 'all'):
+            self.junc_loss.pos_weight = self.junc_loss.pos_weight.to(device)
+            loss_jloc = self.junc_loss(jloc_pred.squeeze(1), jloc_gt)
+            junc_mask = jloc_gt.unsqueeze(1)                    # (B,1,H,W) already binary float
+            loss_joff = F.l1_loss(joff_pred * junc_mask,
+                                  joff_gt  * junc_mask,
+                                  reduction='sum') / (junc_mask.sum() + 1e-6)
+        else:
+            loss_jloc = zero
+            loss_joff = zero
 
-        # loss_mask : BCE on building / background segmentation
-        loss_mask = F.binary_cross_entropy_with_logits(mask_pred[:, 1], mask_gt)
+        # region branch losses
+        # ADDED: remask_pred is computed via afm_predictor -> refuse_conv ->
+        # final_conv, so it is never independent of the line branch weights.
+        # In isolated "region" mode only loss_mask (mask_predictor, a fully
+        # dedicated head) is used; loss_remask is skipped so no gradient
+        # leaks into afm_predictor/refuse_conv through the region branch.
+        if self.active_branch == 'all':
+            loss_mask   = F.binary_cross_entropy_with_logits(mask_pred[:, 1], mask_gt)
+            loss_remask = F.binary_cross_entropy_with_logits(remask_pred[:, 1], mask_gt)
+        elif self.active_branch == 'region':
+            loss_mask   = F.binary_cross_entropy_with_logits(mask_pred[:, 1], mask_gt)
+            loss_remask = zero
+        else:
+            loss_mask   = zero
+            loss_remask = zero
 
-        # loss_afm : L1 on angle field map
-        loss_afm = F.l1_loss(afm_pred, afmap_gt)
-
-        # loss_remask : refined mask BCE
-        loss_remask = F.binary_cross_entropy_with_logits(remask_pred[:, 1], mask_gt)
+        # line branch loss
+        # ADDED: isolated raster mode uses afm_predictor (2 channels, dx/dy
+        # to nearest contour pixel) trained with MAE against the distance
+        # transform of gt_lines. Smoother gradient than a direct binary
+        # target, same head/loss shape as "all" mode.
+        if self.active_branch in ('line', 'all'):
+            loss_afm = F.l1_loss(afm_pred, afmap_gt)
+        else:
+            loss_afm = zero
 
         loss_dict = {
             'loss_jloc'  : loss_jloc,
@@ -176,7 +266,57 @@ class BuildingDetector(nn.Module):
             'loss_afm'   : loss_afm,
             'loss_remask': loss_remask,
         }
-        return loss_dict, {'remask_pred': remask_pred[:, 1].detach()}  # expose refined mask logit for validation
+
+        extras = {'remask_pred': remask_pred[:, 1].detach()}  # expose refined mask logit for validation
+        # -----------------------------------------------------------------
+        # ADDED: expose a single (B,H,W) map for raster-mode validation.
+        # For the line branch, afm_pred must first be decoded back to a
+        # pixel offset (afm_to_pixel_offset) before its norm means anything
+        # in pixels; 1/(1+norm_px) then gives a [0,1] boundary-likeness map.
+        # -----------------------------------------------------------------
+        if is_raster_mode:
+            if self.active_branch in ('point', 'point_sce'):
+                extras['branch_pred'] = jloc_pred.squeeze(1).detach()
+            elif self.active_branch == 'line':
+                ax, ay = afm_to_pixel_offset(afm_pred, self.pred_height, self.pred_width)
+                afm_norm_px = torch.sqrt(ax ** 2 + ay ** 2 + 1e-6)
+                extras['branch_pred'] = (1.0 / (1.0 + afm_norm_px)).detach()
+            elif self.active_branch == 'region':
+                # use mask_pred (isolated head), not remask_pred (goes through afm_predictor)
+                extras['branch_pred'] = mask_pred[:, 1].detach()
+
+        return loss_dict, extras
+
+    # -------------------------------------------------------------------
+    # ADDED: builds the targets dict from GT rasters (RasterGTDataset)
+    # instead of COCO polygons, so isolated branches skip Encoder entirely.
+    # -------------------------------------------------------------------
+    def _targets_from_rasters(self, annotations, device):
+        mask_gt  = torch.stack([torch.as_tensor(a['gt_region']) for a in annotations]).float()
+        lines_gt = torch.stack([torch.as_tensor(a['gt_lines'])  for a in annotations]).float()
+        jloc_gt  = torch.stack([torch.as_tensor(a['gt_nodes'])  for a in annotations]).float()
+
+        b, h, w = mask_gt.shape
+        joff_gt = torch.zeros((b, 2, h, w), dtype=torch.float32)
+
+        # -----------------------------------------------------------------
+        # ADDED: gt_afm is precomputed by build_gt_rasters_from_brp.py
+        # using the real afm_op CUDA operator on vector BRP edges (not a
+        # raster approximation).
+        # -----------------------------------------------------------------
+        if 'gt_afm' in annotations[0]:
+            afmap_gt = torch.stack([torch.as_tensor(a['gt_afm']) for a in annotations]).float()
+        else:
+            afmap_gt = torch.zeros((b, 2, h, w), dtype=torch.float32)
+
+        targets = {
+            'jloc':     jloc_gt.unsqueeze(1),
+            'joff':     joff_gt,
+            'mask':     mask_gt.unsqueeze(1),
+            'afmap':    afmap_gt,
+            'lines_gt': lines_gt,
+        }
+        return {k: v.to(device) for k, v in targets.items()}
 
     def forward_test(self, images, annotations=None):
         device = images.device

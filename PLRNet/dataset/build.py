@@ -74,6 +74,47 @@ def build_train_dataset_multi(cfg):
     return dataset
 
 
+# -------------------------------------------------------------------------
+# ADDED: dataset builder for isolated single-branch training with GT
+# rasters (RasterGTDataset) instead of a COCO json. Image and GT rasters
+# are already 256x256 at TARGET resolution, so a single ResizeImage +
+# ToTensor + Normalize is enough (no separate ann resize needed).
+# -------------------------------------------------------------------------
+def build_train_dataset_raster(cfg, root, stems_file=None, is_val=False):
+    from .train_dataset import RasterGTDataset, collate_fn_raster
+
+    transform = Compose(
+        [ResizeImage(cfg.DATASETS.IMAGE.HEIGHT, cfg.DATASETS.IMAGE.WIDTH),
+         ToTensor(),
+         Normalize(cfg.DATASETS.IMAGE.PIXEL_MEAN,
+                   cfg.DATASETS.IMAGE.PIXEL_STD,
+                   cfg.DATASETS.IMAGE.TO_255),
+         ])
+
+    # validation must be deterministic: no shuffle, no augmentation,
+    # so scores are comparable epoch to epoch
+    # -------------------------------------------------------------------
+    # ADDED: augment=not is_val — rotate_f=False alone was not enough,
+    # RasterGTDataset still applied a random flip in that case (see the
+    # "reminder" comment in train_dataset.py).
+    # -------------------------------------------------------------------
+    dataset = RasterGTDataset(
+        root=root,
+        active_branch=cfg.MODEL.ACTIVE_BRANCH,
+        transform=transform,
+        rotate_f=False if is_val else cfg.DATASETS.ROTATE_F,
+        stems_file=stems_file,
+        augment=not is_val,
+    )
+
+    dataset = torch.utils.data.DataLoader(dataset,
+                                          batch_size=cfg.SOLVER.IMS_PER_BATCH,
+                                          collate_fn=collate_fn_raster,
+                                          shuffle=not is_val,
+                                          num_workers=cfg.DATALOADER.NUM_WORKERS)
+    return dataset
+
+
 def build_test_dataset(cfg):
     transforms = Compose(
         [ResizeImage(cfg.DATASETS.IMAGE.HEIGHT,

@@ -39,6 +39,7 @@ MODEL:
     loss_afm : 0.1
     loss_remask : 1.0
   JLOC_POS_WEIGHT: 50.0
-  ACTIVE_BRANCH: "region"
+  ACTIVE_BRANCH: "point_sce"
+  LINE_CHECKPOINT: "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp_raster/line/2026-07-13_13-53-21/checkpoints/best_val_loss.pth"
 
-OUTPUT_DIR: "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp_raster/region"
+OUTPUT_DIR: "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp_raster/point_sce"

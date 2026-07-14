@@ -1,4 +1,5 @@
 import cv2
+import os
 import random
 import os.path as osp
 import numpy as np
@@ -73,7 +74,7 @@ class TrainDataset(Dataset):
                 points = segm[:-1]
 
                 junc_tags = np.ones(points.shape[0])
-                if i == 0:  
+                if i == 0:
 
                     poly = Polygon(points)
                     if poly.area > 0:
@@ -204,5 +205,171 @@ class TrainDataset(Dataset):
 
 def collate_fn(batch):
 
+    return (default_collate([b[0] for b in batch]),
+            [b[1] for b in batch])
+
+
+# ---------------------------------------------------------------------------
+# ADDED: raster-based GT dataset for isolated single-branch training
+# (region / line / point), no COCO json involved.
+# ---------------------------------------------------------------------------
+
+class RasterGTDataset(Dataset):
+    """
+    Loads (Sentinel-2 patch, GT raster) pairs from separate folders instead
+    of a COCO json. Used for isolated single-branch training with GT rasters
+    produced by build_gt_rasters_from_brp.py.
+
+    Expected layout:
+      root/images/<stem>.tif
+      root/gt_region/<stem>.tif   binary parcel mask {0,1}   (mask head)
+      root/gt_lines/<stem>.tif    1px boundary map {0,1}     (afm head)
+      root/gt_nodes/<stem>.tif    filtered corners {0,1}     (jloc head)
+
+    Only the raster required by active_branch is actually read from disk;
+    the other two are returned as zero arrays so the collate/model code
+    stays shape-consistent regardless of which branch is being trained.
+    """
+
+    GT_SUBDIRS = {
+        'region':    'gt_region',
+        'line':      'gt_lines',
+        'point':     'gt_nodes',
+        'point_sce': 'gt_nodes',  # same target as "point", just with frozen-line SCE guidance
+    }
+
+    def __init__(self, root, active_branch, transform=None, rotate_f=None,
+                 stems_file=None, augment=True):
+        assert active_branch in ('region', 'line', 'point', 'point_sce'), \
+            f"RasterGTDataset only supports single-branch training, got {active_branch!r}"
+        self.root = root
+        self.active_branch = active_branch
+        self.transform = transform
+        self.rotate_f = rotate_f
+        # augment=False forces no flip/rotate at all (deterministic val/test)
+        self.augment = augment
+
+        if stems_file is not None:
+            # train/val share the same patches/train/ folder; the actual
+            # split is a list of stems (see data_nl/patches/train.txt, val.txt)
+            with open(stems_file) as f:
+                self.stems = sorted(line.strip() for line in f if line.strip())
+        else:
+            img_dir = osp.join(root, 'images')
+            self.stems = sorted(
+                osp.splitext(f)[0] for f in os.listdir(img_dir)
+                if f.lower().endswith(('.tif', '.tiff'))
+            )
+        self.num_samples = len(self.stems)
+
+    def _read_tif(self, path):
+        with rasterio.open(path) as src:
+            return src.read(1).astype(np.float32)
+
+    # -------------------------------------------------------------------
+    # ADDED: reads a multi-band raster (used for gt_afm, 2 bands dx/dy)
+    # -------------------------------------------------------------------
+    def _read_tif_multiband(self, path):
+        with rasterio.open(path) as src:
+            return src.read().astype(np.float32)  # (bands, H, W)
+
+    def __getitem__(self, idx_):
+        stem = self.stems[idx_]
+
+        img_path = osp.join(self.root, 'images', stem + '.tif')
+        with rasterio.open(img_path) as src:
+            image = src.read([1, 2, 3]).transpose(1, 2, 0).astype(np.float32) / 10000.0
+        np.nan_to_num(image, nan=0.0, copy=False)
+        height, width = image.shape[0], image.shape[1]
+
+        gt_subdir = self.GT_SUBDIRS[self.active_branch]
+        gt_path = osp.join(self.root, gt_subdir, stem + '.tif')
+        gt_raster = self._read_tif(gt_path)
+        gt_raster = np.clip(gt_raster, 0.0, 1.0)
+
+        ann = {
+            'width': width,
+            'height': height,
+            'filename': stem + '.tif',
+            'active_branch': self.active_branch,
+            'gt_region': np.zeros((height, width), dtype=np.float32),
+            'gt_lines':  np.zeros((height, width), dtype=np.float32),
+            'gt_nodes':  np.zeros((height, width), dtype=np.float32),
+        }
+        ann['gt_' + self.GT_SUBDIRS[self.active_branch][3:]] = gt_raster
+
+        # -------------------------------------------------------------------
+        # ADDED: line branch needs the 2-band (dx,dy) AFM target,
+        # precomputed by build_gt_rasters_from_brp.py via afm_op
+        # -------------------------------------------------------------------
+        if self.active_branch == 'line':
+            afm_path = osp.join(self.root, 'gt_afm', stem + '.tif')
+            ann['gt_afm'] = self._read_tif_multiband(afm_path)
+
+        # ADDED: augment=False forces reminder=0 (no flip/rotate at all),
+        # needed for deterministic validation — the rotate_f branch alone
+        # still applied a random flip even when rotate_f=False.
+        if not self.augment:
+            reminder = 0
+        elif self.rotate_f:
+            reminder = random.randint(0, 5)
+        else:
+            reminder = random.randint(0, 3)
+        ann['reminder'] = reminder
+
+        # flip/copy: fliplr/flipud return negative-stride views, which
+        # torch.from_numpy (called later in ToTensor) cannot handle
+        gt_key = 'gt_' + gt_subdir[3:]
+        if reminder == 1:
+            image = image[:, ::-1, :].copy()
+            ann[gt_key] = np.fliplr(ann[gt_key]).copy()
+        elif reminder == 2:
+            image = image[::-1, :, :].copy()
+            ann[gt_key] = np.flipud(ann[gt_key]).copy()
+        elif reminder == 3:
+            image = image[::-1, ::-1, :].copy()
+            ann[gt_key] = np.fliplr(np.flipud(ann[gt_key])).copy()
+        elif reminder == 4:
+            rot_matrix = cv2.getRotationMatrix2D((width / 2, height / 2), 90, 1)
+            image = cv2.warpAffine(image, rot_matrix, (width, height))
+            ann[gt_key] = cv2.warpAffine(ann[gt_key], rot_matrix, (width, height))
+        elif reminder == 5:
+            rot_matrix = cv2.getRotationMatrix2D((width / 2, height / 2), 270, 1)
+            image = cv2.warpAffine(image, rot_matrix, (width, height))
+            ann[gt_key] = cv2.warpAffine(ann[gt_key], rot_matrix, (width, height))
+
+        # -------------------------------------------------------------------
+        # ADDED: gt_afm holds (dx,dy) vectors, not a plain raster — flipping
+        # or rotating the image also needs to rotate the vector components
+        # themselves, not just move the pixels around.
+        # -------------------------------------------------------------------
+        if 'gt_afm' in ann:
+            afm = ann['gt_afm']  # (2, H, W): afm[0]=dx, afm[1]=dy
+            dx, dy = afm[0], afm[1]
+            if reminder == 1:
+                dx, dy = np.fliplr(-dx), np.fliplr(dy)
+            elif reminder == 2:
+                dx, dy = np.flipud(dx), np.flipud(-dy)
+            elif reminder == 3:
+                dx, dy = np.fliplr(np.flipud(-dx)), np.fliplr(np.flipud(-dy))
+            elif reminder == 4:
+                rot_matrix = cv2.getRotationMatrix2D((width / 2, height / 2), 90, 1)
+                dx, dy = cv2.warpAffine(dy, rot_matrix, (width, height)), \
+                         cv2.warpAffine(-dx, rot_matrix, (width, height))
+            elif reminder == 5:
+                rot_matrix = cv2.getRotationMatrix2D((width / 2, height / 2), 270, 1)
+                dx, dy = cv2.warpAffine(-dy, rot_matrix, (width, height)), \
+                         cv2.warpAffine(dx, rot_matrix, (width, height))
+            ann['gt_afm'] = np.stack([dx, dy], axis=0).copy().astype(np.float32)
+
+        if self.transform is not None:
+            return self.transform(image, ann)
+        return image, ann
+
+    def __len__(self):
+        return self.num_samples
+
+
+def collate_fn_raster(batch):
     return (default_collate([b[0] for b in batch]),
             [b[1] for b in batch])

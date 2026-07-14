@@ -19,6 +19,7 @@ import rasterio
 from PLRNet.config import cfg
 from PLRNet.detector import BuildingDetector
 from PLRNet.dataset import build_train_dataset, build_test_dataset
+from PLRNet.dataset.build import build_train_dataset_raster
 from PLRNet.utils.comm import to_single_device
 from PLRNet.solver import make_lr_scheduler, make_optimizer
 from PLRNet.utils.logger import setup_logger
@@ -564,6 +565,251 @@ def train(cfg, output_dir, val_every):
 
 
 # ------------------------------------------------------------------ #
+# ADDED: isolated single-branch training on GT rasters (region/line/point)
+# instead of COCO. Separate from train() to avoid entangling the COCO-only
+# visualization / junction-recall code with the raster path.
+# ------------------------------------------------------------------ #
+GT_KEY_BY_BRANCH = {
+    'region':    'gt_region',
+    'line':      'gt_lines',
+    'point':     'gt_nodes',
+    'point_sce': 'gt_nodes',
+}
+
+
+@torch.no_grad()
+def validate_raster(model, val_loader, loss_reducer, device, loss_names, active_branch):
+    """Simple deterministic validation for one isolated branch: mean loss
+    + a pixel metric (IoU for region, precision/recall for line/point)."""
+    model.eval()
+    sums   = {k: 0.0 for k in loss_names}
+    total  = 0.0
+    n_loss = 0
+
+    gt_key   = GT_KEY_BY_BRANCH[active_branch]
+    iou_sum  = 0.0
+    tp = fp = fn = 0
+    n_iou = 0
+
+    for images, annotations in val_loader:
+        images      = images.to(device)
+        annotations = to_single_device(annotations, device)
+
+        loss_dict, extras = model.forward_train(images, annotations)
+        weighted = loss_reducer(loss_dict)
+        for k in loss_names:
+            sums[k] += loss_dict[k].item()
+        total  += weighted.item()
+        n_loss += images.size(0)
+
+        gt_batch = torch.stack([a[gt_key].squeeze() for a in annotations]).to(device)
+        # ---------------------------------------------------------------
+        # ADDED: branch_pred is a raw logit for region/point/point_sce
+        # (needs sigmoid), but for line it is already a [0,1] boundary
+        # likeness map (1/(1+afm_norm), see detector.py) — applying
+        # sigmoid again would flatten it and break precision/recall.
+        # ---------------------------------------------------------------
+        if active_branch == 'line':
+            pred_prob = extras['branch_pred']
+        else:
+            pred_prob = extras['branch_pred'].sigmoid()
+
+        if active_branch == 'region':
+            for b in range(pred_prob.size(0)):
+                pred_bin = (pred_prob[b] > 0.5).cpu().numpy()
+                gt_bin   = (gt_batch[b] > 0.5).cpu().numpy()
+                if gt_bin.sum() == 0:
+                    continue
+                iou_sum += calc_IoU(pred_bin, gt_bin)
+                n_iou   += 1
+        else:
+            for b in range(pred_prob.size(0)):
+                pred_bin = (pred_prob[b] > 0.5).cpu().numpy()
+                gt_bin   = (gt_batch[b] > 0.5).cpu().numpy()
+                tp += int(np.logical_and(pred_bin, gt_bin).sum())
+                fp += int(np.logical_and(pred_bin, ~gt_bin).sum())
+                fn += int(np.logical_and(~pred_bin, gt_bin).sum())
+
+    avg       = {k: sums[k] / max(n_loss, 1) for k in loss_names}
+    avg_total = total / max(n_loss, 1)
+
+    metrics = {}
+    if active_branch == 'region':
+        metrics['iou'] = iou_sum / max(n_iou, 1)
+    else:
+        metrics['precision'] = tp / max(tp + fp, 1)
+        metrics['recall']    = tp / max(tp + fn, 1)
+
+    return avg_total, avg, metrics
+
+
+def train_raster(cfg, output_dir, val_every):
+    """Train a single isolated branch (region/line/point/point_sce) on GT
+    rasters produced by data_nl/build_gt_rasters_from_brp.py, no COCO involved."""
+    logger = logging.getLogger("training")
+    device = cfg.MODEL.DEVICE
+    active_branch = cfg.MODEL.ACTIVE_BRANCH
+    assert active_branch in ('region', 'line', 'point', 'point_sce'), \
+        f"train_raster requires ACTIVE_BRANCH in (region,line,point,point_sce), got {active_branch!r}"
+
+    model = BuildingDetector(cfg).to(device)
+
+    # ADDED: point_sce loads the afm_head weights from an already-trained
+    # line-branch checkpoint and freezes them, so the point branch gets SCE
+    # guidance from a working boundary feature instead of a random one.
+    if active_branch == 'point_sce':
+        line_ckpt = cfg.MODEL.LINE_CHECKPOINT
+        assert line_ckpt, "ACTIVE_BRANCH=point_sce requires MODEL.LINE_CHECKPOINT to be set"
+        model.load_and_freeze_afm_head(line_ckpt, device)
+        logger.info(f"Loaded and froze afm_head from {line_ckpt}")
+
+    data_nl_patches = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data_nl', 'patches')
+    train_root  = os.path.join(data_nl_patches, 'train')
+    train_stems = os.path.join(data_nl_patches, 'train.txt')
+    val_stems   = os.path.join(data_nl_patches, 'val.txt')
+
+    train_loader = build_train_dataset_raster(cfg, train_root, stems_file=train_stems, is_val=False)
+    val_loader   = build_train_dataset_raster(cfg, train_root, stems_file=val_stems,   is_val=True)
+
+    optimizer    = make_optimizer(cfg, model)
+    scheduler    = make_lr_scheduler(cfg, optimizer)
+    loss_reducer = LossReducer(cfg)
+    loss_weights = dict(cfg.MODEL.LOSS_WEIGHTS)
+    loss_names   = list(loss_weights.keys())
+
+    max_epoch = cfg.SOLVER.MAX_EPOCH
+
+    checkpoints_dir = os.path.join(output_dir, 'checkpoints')
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
+    best_val_loss = float('inf')
+
+    def save_checkpoint(name, current_epoch):
+        state = {
+            'epoch'    : current_epoch,
+            'model'    : model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+        }
+        path = os.path.join(checkpoints_dir, name)
+        torch.save(state, path)
+        logger.info(f"Checkpoint saved -> checkpoints/{name}")
+
+    csv_path = os.path.join(output_dir, 'metrics.csv')
+    metric_name = 'iou' if active_branch == 'region' else 'precision,recall'
+    fieldnames = (['epoch', 'train_loss'] + ['w_' + k for k in loss_names]
+                  + ['val_loss'] + ['val_w_' + k for k in loss_names]
+                  + [f'val_{m}' for m in (['iou'] if active_branch == 'region'
+                                           else ['precision', 'recall'])])
+    with open(csv_path, 'w', newline='') as f:
+        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+
+    start_time = time.time()
+    end = time.time()
+
+    for epoch in range(1, max_epoch + 1):
+        meters = MetricLogger(" ")
+        model.train()
+
+        epoch_loss_sums = {k: 0.0 for k in loss_names}
+        epoch_total     = 0.0
+        n_batches       = 0
+
+        for it, (images, annotations) in enumerate(train_loader):
+            data_time   = time.time() - end
+            images      = images.to(device)
+            annotations = to_single_device(annotations, device)
+
+            loss_dict, extras = model(images, annotations)
+            total_loss        = loss_reducer(loss_dict)
+
+            with torch.no_grad():
+                loss_dict_red = {k: v.item() for k, v in loss_dict.items()}
+                loss_red      = total_loss.item()
+                meters.update(loss=loss_red, **loss_dict_red)
+                for k in loss_names:
+                    epoch_loss_sums[k] += loss_dict_red.get(k, 0.0)
+                epoch_total += loss_red
+                n_batches   += 1
+
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+
+            batch_time = time.time() - end
+            end = time.time()
+            meters.update(time=batch_time, data=data_time)
+
+            if it % 20 == 0:
+                logger.info(
+                    meters.delimiter.join([
+                        "epoch: {epoch}", "iter: {iter}", "{meters}",
+                        "lr: {lr:.6f}",
+                    ]).format(
+                        epoch=epoch, iter=it, meters=str(meters),
+                        lr=optimizer.param_groups[0]["lr"],
+                    )
+                )
+
+        scheduler.step()
+
+        avg_total  = epoch_total / max(n_batches, 1)
+        avg_losses = {k: epoch_loss_sums[k] / max(n_batches, 1) for k in loss_names}
+
+        save_checkpoint('latest.pth', epoch)
+
+        val_total  = float('nan')
+        val_losses = {k: float('nan') for k in loss_names}
+        val_metrics = {}
+
+        if epoch % val_every == 0:
+            logger.info(f"=== Validation at epoch {epoch} (branch={active_branch}) ===")
+            val_total, val_losses, val_metrics = validate_raster(
+                model, val_loader, loss_reducer, device, loss_names, active_branch)
+            logger.info(
+                "Val total_loss: {:.4f}  |  {}".format(
+                    val_total,
+                    "  ".join(f"{k}: {v:.4f}" for k, v in val_losses.items())
+                )
+            )
+            logger.info(f"Val metrics ({active_branch}): " +
+                        "  ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+            save_checkpoint(f'epoch_{epoch}.pth', epoch)
+
+            if val_total < best_val_loss:
+                best_val_loss = val_total
+                save_checkpoint('best_val_loss.pth', epoch)
+                logger.info(f"New best val loss: {best_val_loss:.4f}")
+
+        row = {'epoch': epoch, 'train_loss': round(avg_total, 6)}
+        for k in loss_names:
+            row['w_' + k] = round(avg_losses[k] * loss_weights[k], 6)
+        row['val_loss'] = round(val_total, 6) if not np.isnan(val_total) else ''
+        for k in loss_names:
+            row['val_w_' + k] = (round(val_losses[k] * loss_weights[k], 6)
+                                 if not np.isnan(val_losses[k]) else '')
+        for m in (['iou'] if active_branch == 'region' else ['precision', 'recall']):
+            row[f'val_{m}'] = round(val_metrics[m], 6) if val_metrics else ''
+        with open(csv_path, 'a', newline='') as f:
+            csv.DictWriter(f, fieldnames=fieldnames).writerow(row)
+
+        logger.info(
+            "Epoch {:03d} | train_loss: {:.4f} | val_loss: {} | lr: {:.6f}".format(
+                epoch, avg_total,
+                f"{val_total:.4f}" if not np.isnan(val_total) else "-",
+                optimizer.param_groups[0]["lr"],
+            )
+        )
+
+    total_time = time.time() - start_time
+    logger.info("Total training time: {} ({:.4f} s / epoch)".format(
+        str(datetime.timedelta(seconds=int(total_time))),
+        total_time / max_epoch,
+    ))
+
+
+# ------------------------------------------------------------------ #
 #  Entry point
 # ------------------------------------------------------------------ #
 if __name__ == "__main__":
@@ -594,4 +840,13 @@ if __name__ == "__main__":
 
     save_config(cfg, os.path.join(output_dir, 'config.yml'))
     set_random_seed(args.seed, True)
-    train(cfg, output_dir, val_every=args.val_every)
+
+    # -------------------------------------------------------------------
+    # ADDED: dispatch to the raster-GT isolated-branch trainer when
+    # ACTIVE_BRANCH names a single branch. "all" keeps the original
+    # COCO-based full-model training path unchanged.
+    # -------------------------------------------------------------------
+    if cfg.MODEL.ACTIVE_BRANCH == 'all':
+        train(cfg, output_dir, val_every=args.val_every)
+    else:
+        train_raster(cfg, output_dir, val_every=args.val_every)
