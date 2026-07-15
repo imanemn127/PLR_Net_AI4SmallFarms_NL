@@ -193,13 +193,15 @@ class BuildingDetector(nn.Module):
         # === ISOLATED BRANCH MODE ===
         # When ACTIVE_BRANCH != "all", SCE cross-attention is disabled so each
         # branch learns only from backbone features with no help from other branches.
-        # "all"      → original full model with SCE (default)
-        # "region"   → mask head only, no AFM guidance
-        # "line"     → afm head only, no cross-branch
-        # "point"    → jloc head only, no AFM guidance
-        # "point_sce"→ jloc head with SCE guidance from a frozen, pre-trained
-        #              afm_head (see train_raster / freeze_afm_head)
-        if self.active_branch == 'all' or self.active_branch == 'point_sce':
+        # "all"        → original full model with SCE (default, COCO GT)
+        # "region"     → mask head only, no AFM guidance
+        # "line"       → afm head only, no cross-branch
+        # "point"      → jloc head only, no AFM guidance
+        # "point_sce"  → jloc head with SCE guidance from a frozen, pre-trained
+        #                afm_head (see train_raster / freeze_afm_head)
+        # "all_raster" → mask+line+point trained together, SCE active, no
+        #                freeze, on raster GT (region/lines/nodes/afm)
+        if self.active_branch in ('all', 'point_sce', 'all_raster'):
             mask_att_feature = self.a2m_att(mask_feature, mask_feature + afm_feature)
             jloc_att_feature = self.a2j_att(jloc_feature, jloc_feature + afm_feature)
         else:
@@ -222,6 +224,9 @@ class BuildingDetector(nn.Module):
         zero = torch.tensor(0.0, device=device)
 
         # point branch losses
+        # ADDED: all_raster has no sub-pixel corner offset (gt_nodes is
+        # already rounded to the pixel grid), so loss_joff stays at zero
+        # there — only loss_jloc (corner yes/no) is meaningful.
         if self.active_branch in ('point', 'point_sce', 'all'):
             self.junc_loss.pos_weight = self.junc_loss.pos_weight.to(device)
             loss_jloc = self.junc_loss(jloc_pred.squeeze(1), jloc_gt)
@@ -229,6 +234,10 @@ class BuildingDetector(nn.Module):
             loss_joff = F.l1_loss(joff_pred * junc_mask,
                                   joff_gt  * junc_mask,
                                   reduction='sum') / (junc_mask.sum() + 1e-6)
+        elif self.active_branch == 'all_raster':
+            self.junc_loss.pos_weight = self.junc_loss.pos_weight.to(device)
+            loss_jloc = self.junc_loss(jloc_pred.squeeze(1), jloc_gt)
+            loss_joff = zero
         else:
             loss_jloc = zero
             loss_joff = zero
@@ -239,7 +248,9 @@ class BuildingDetector(nn.Module):
         # In isolated "region" mode only loss_mask (mask_predictor, a fully
         # dedicated head) is used; loss_remask is skipped so no gradient
         # leaks into afm_predictor/refuse_conv through the region branch.
-        if self.active_branch == 'all':
+        # all_raster trains line jointly anyway, so remask_pred's coupling
+        # to afm_predictor is fine — both losses stay active, like "all".
+        if self.active_branch in ('all', 'all_raster'):
             loss_mask   = F.binary_cross_entropy_with_logits(mask_pred[:, 1], mask_gt)
             loss_remask = F.binary_cross_entropy_with_logits(remask_pred[:, 1], mask_gt)
         elif self.active_branch == 'region':
@@ -250,11 +261,10 @@ class BuildingDetector(nn.Module):
             loss_remask = zero
 
         # line branch loss
-        # ADDED: isolated raster mode uses afm_predictor (2 channels, dx/dy
-        # to nearest contour pixel) trained with MAE against the distance
-        # transform of gt_lines. Smoother gradient than a direct binary
-        # target, same head/loss shape as "all" mode.
-        if self.active_branch in ('line', 'all'):
+        # ADDED: raster modes (line, all_raster) use afm_predictor (2
+        # channels) trained with MAE against gt_afm (afm_op on BRP vector
+        # edges). Same head/loss shape as "all" mode, different GT source.
+        if self.active_branch in ('line', 'all', 'all_raster'):
             loss_afm = F.l1_loss(afm_pred, afmap_gt)
         else:
             loss_afm = zero
@@ -284,6 +294,14 @@ class BuildingDetector(nn.Module):
             elif self.active_branch == 'region':
                 # use mask_pred (isolated head), not remask_pred (goes through afm_predictor)
                 extras['branch_pred'] = mask_pred[:, 1].detach()
+            elif self.active_branch == 'all_raster':
+                # all 3 branches trained together — expose one map per
+                # branch so validate_raster can score each independently
+                ax, ay = afm_to_pixel_offset(afm_pred, self.pred_height, self.pred_width)
+                afm_norm_px = torch.sqrt(ax ** 2 + ay ** 2 + 1e-6)
+                extras['branch_pred_region'] = mask_pred[:, 1].detach()
+                extras['branch_pred_line']   = (1.0 / (1.0 + afm_norm_px)).detach()
+                extras['branch_pred_point']  = jloc_pred.squeeze(1).detach()
 
         return loss_dict, extras
 

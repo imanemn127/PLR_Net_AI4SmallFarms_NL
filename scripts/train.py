@@ -576,20 +576,65 @@ GT_KEY_BY_BRANCH = {
     'point_sce': 'gt_nodes',
 }
 
+# ------------------------------------------------------------------ #
+# ADDED: all_raster scores all 3 branches at once — each entry maps a
+# sub-branch name to (GT key, extras key, metric kind)
+# ------------------------------------------------------------------ #
+ALL_RASTER_SUBBRANCHES = [
+    ('region', 'gt_region', 'branch_pred_region', 'iou'),
+    ('line',   'gt_lines',  'branch_pred_line',   'precision_recall'),
+    ('point',  'gt_nodes',  'branch_pred_point',  'precision_recall'),
+]
+
+
+def _metric_names_for_branch(active_branch):
+    """CSV column suffixes (without the val_ prefix) for a given branch."""
+    if active_branch == 'all_raster':
+        names = []
+        for name, _, _, metric_kind in ALL_RASTER_SUBBRANCHES:
+            names += [f'{name}_iou'] if metric_kind == 'iou' else [f'{name}_precision', f'{name}_recall']
+        return names
+    if active_branch == 'region':
+        return ['iou']
+    return ['precision', 'recall']
+
+
+def _score_binary(pred_prob, gt_batch, metric_kind, state):
+    """Accumulate IoU or TP/FP/FN for one branch's predictions in `state`."""
+    if metric_kind == 'iou':
+        for b in range(pred_prob.size(0)):
+            pred_bin = (pred_prob[b] > 0.5).cpu().numpy()
+            gt_bin   = (gt_batch[b] > 0.5).cpu().numpy()
+            if gt_bin.sum() == 0:
+                continue
+            state['iou_sum'] += calc_IoU(pred_bin, gt_bin)
+            state['n_iou']   += 1
+    else:
+        for b in range(pred_prob.size(0)):
+            pred_bin = (pred_prob[b] > 0.5).cpu().numpy()
+            gt_bin   = (gt_batch[b] > 0.5).cpu().numpy()
+            state['tp'] += int(np.logical_and(pred_bin, gt_bin).sum())
+            state['fp'] += int(np.logical_and(pred_bin, ~gt_bin).sum())
+            state['fn'] += int(np.logical_and(~pred_bin, gt_bin).sum())
+
 
 @torch.no_grad()
 def validate_raster(model, val_loader, loss_reducer, device, loss_names, active_branch):
     """Simple deterministic validation for one isolated branch: mean loss
-    + a pixel metric (IoU for region, precision/recall for line/point)."""
+    + a pixel metric (IoU for region, precision/recall for line/point).
+    For all_raster, all 3 branches are scored at once."""
     model.eval()
     sums   = {k: 0.0 for k in loss_names}
     total  = 0.0
     n_loss = 0
 
-    gt_key   = GT_KEY_BY_BRANCH[active_branch]
-    iou_sum  = 0.0
-    tp = fp = fn = 0
-    n_iou = 0
+    is_all_raster = active_branch == 'all_raster'
+    if is_all_raster:
+        states = {name: {'iou_sum': 0.0, 'n_iou': 0, 'tp': 0, 'fp': 0, 'fn': 0}
+                  for name, _, _, _ in ALL_RASTER_SUBBRANCHES}
+    else:
+        gt_key = GT_KEY_BY_BRANCH[active_branch]
+        state  = {'iou_sum': 0.0, 'n_iou': 0, 'tp': 0, 'fp': 0, 'fn': 0}
 
     for images, annotations in val_loader:
         images      = images.to(device)
@@ -602,43 +647,42 @@ def validate_raster(model, val_loader, loss_reducer, device, loss_names, active_
         total  += weighted.item()
         n_loss += images.size(0)
 
-        gt_batch = torch.stack([a[gt_key].squeeze() for a in annotations]).to(device)
-        # ---------------------------------------------------------------
-        # ADDED: branch_pred is a raw logit for region/point/point_sce
-        # (needs sigmoid), but for line it is already a [0,1] boundary
-        # likeness map (1/(1+afm_norm), see detector.py) — applying
-        # sigmoid again would flatten it and break precision/recall.
-        # ---------------------------------------------------------------
-        if active_branch == 'line':
-            pred_prob = extras['branch_pred']
+        if is_all_raster:
+            for name, gt_key_b, extras_key, metric_kind in ALL_RASTER_SUBBRANCHES:
+                gt_batch = torch.stack([a[gt_key_b].squeeze() for a in annotations]).to(device)
+                # line's branch_pred is already a [0,1] map (see detector.py);
+                # region/point expose a raw logit and need sigmoid
+                pred_prob = extras[extras_key] if name == 'line' else extras[extras_key].sigmoid()
+                _score_binary(pred_prob, gt_batch, metric_kind, states[name])
         else:
-            pred_prob = extras['branch_pred'].sigmoid()
-
-        if active_branch == 'region':
-            for b in range(pred_prob.size(0)):
-                pred_bin = (pred_prob[b] > 0.5).cpu().numpy()
-                gt_bin   = (gt_batch[b] > 0.5).cpu().numpy()
-                if gt_bin.sum() == 0:
-                    continue
-                iou_sum += calc_IoU(pred_bin, gt_bin)
-                n_iou   += 1
-        else:
-            for b in range(pred_prob.size(0)):
-                pred_bin = (pred_prob[b] > 0.5).cpu().numpy()
-                gt_bin   = (gt_batch[b] > 0.5).cpu().numpy()
-                tp += int(np.logical_and(pred_bin, gt_bin).sum())
-                fp += int(np.logical_and(pred_bin, ~gt_bin).sum())
-                fn += int(np.logical_and(~pred_bin, gt_bin).sum())
+            gt_batch = torch.stack([a[gt_key].squeeze() for a in annotations]).to(device)
+            # ---------------------------------------------------------------
+            # ADDED: branch_pred is a raw logit for region/point/point_sce
+            # (needs sigmoid), but for line it is already a [0,1] boundary
+            # likeness map (1/(1+afm_norm), see detector.py) — applying
+            # sigmoid again would flatten it and break precision/recall.
+            # ---------------------------------------------------------------
+            pred_prob = extras['branch_pred'] if active_branch == 'line' else extras['branch_pred'].sigmoid()
+            metric_kind = 'iou' if active_branch == 'region' else 'precision_recall'
+            _score_binary(pred_prob, gt_batch, metric_kind, state)
 
     avg       = {k: sums[k] / max(n_loss, 1) for k in loss_names}
     avg_total = total / max(n_loss, 1)
 
     metrics = {}
-    if active_branch == 'region':
-        metrics['iou'] = iou_sum / max(n_iou, 1)
+    if is_all_raster:
+        for name, _, _, metric_kind in ALL_RASTER_SUBBRANCHES:
+            s = states[name]
+            if metric_kind == 'iou':
+                metrics[f'{name}_iou'] = s['iou_sum'] / max(s['n_iou'], 1)
+            else:
+                metrics[f'{name}_precision'] = s['tp'] / max(s['tp'] + s['fp'], 1)
+                metrics[f'{name}_recall']    = s['tp'] / max(s['tp'] + s['fn'], 1)
+    elif active_branch == 'region':
+        metrics['iou'] = state['iou_sum'] / max(state['n_iou'], 1)
     else:
-        metrics['precision'] = tp / max(tp + fp, 1)
-        metrics['recall']    = tp / max(tp + fn, 1)
+        metrics['precision'] = state['tp'] / max(state['tp'] + state['fp'], 1)
+        metrics['recall']    = state['tp'] / max(state['tp'] + state['fn'], 1)
 
     return avg_total, avg, metrics
 
@@ -649,8 +693,8 @@ def train_raster(cfg, output_dir, val_every):
     logger = logging.getLogger("training")
     device = cfg.MODEL.DEVICE
     active_branch = cfg.MODEL.ACTIVE_BRANCH
-    assert active_branch in ('region', 'line', 'point', 'point_sce'), \
-        f"train_raster requires ACTIVE_BRANCH in (region,line,point,point_sce), got {active_branch!r}"
+    assert active_branch in ('region', 'line', 'point', 'point_sce', 'all_raster'), \
+        f"train_raster requires ACTIVE_BRANCH in (region,line,point,point_sce,all_raster), got {active_branch!r}"
 
     model = BuildingDetector(cfg).to(device)
 
@@ -697,11 +741,10 @@ def train_raster(cfg, output_dir, val_every):
         logger.info(f"Checkpoint saved -> checkpoints/{name}")
 
     csv_path = os.path.join(output_dir, 'metrics.csv')
-    metric_name = 'iou' if active_branch == 'region' else 'precision,recall'
+    metric_names = _metric_names_for_branch(active_branch)
     fieldnames = (['epoch', 'train_loss'] + ['w_' + k for k in loss_names]
                   + ['val_loss'] + ['val_w_' + k for k in loss_names]
-                  + [f'val_{m}' for m in (['iou'] if active_branch == 'region'
-                                           else ['precision', 'recall'])])
+                  + [f'val_{m}' for m in metric_names])
     with open(csv_path, 'w', newline='') as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
@@ -789,7 +832,7 @@ def train_raster(cfg, output_dir, val_every):
         for k in loss_names:
             row['val_w_' + k] = (round(val_losses[k] * loss_weights[k], 6)
                                  if not np.isnan(val_losses[k]) else '')
-        for m in (['iou'] if active_branch == 'region' else ['precision', 'recall']):
+        for m in metric_names:
             row[f'val_{m}'] = round(val_metrics[m], 6) if val_metrics else ''
         with open(csv_path, 'a', newline='') as f:
             csv.DictWriter(f, fieldnames=fieldnames).writerow(row)

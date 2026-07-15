@@ -572,7 +572,7 @@ This is left as future work.
 
 ## Raster GT Pipeline (region/line/point isolated on GeoTIFF targets)
 
-Following the diagnosis above, the tutor asked to rebuild GT for each branch directly
+Following the diagnosis above, the tutors asked to rebuild GT for each branch directly
 from the BRP vector (no `rasterio.shapes` round-trip) and train the 3 branches
 independently against these rasters instead of COCO. This starts a new run numbering
 (`Run1`, `Run2`, ...), separate from the COCO-pipeline runs above (NL1–NL8).
@@ -729,7 +729,7 @@ over-detection.
 
 ### Switching the line branch to a real vector AFM (`afm_op`)
 
-Follow-up tutor meeting: revisit the line branch to predict a 2-channel
+Follow-up tutors meeting: revisit the line branch to predict a 2-channel
 **distance/direction field** (dx, dy to the nearest boundary) instead of a direct binary
 map — a continuous signal gives a smoother gradient than a hard 0/1 target, and is closer
 to what the article actually does (`afm_op`, the CUDA operator from the original PLR-Net
@@ -804,7 +804,7 @@ this creates the visible grid. Likely because the true "direction to nearest bou
 locally ill-defined deep inside a large uniform parcel, so the network has no strong
 signal to anchor a stable direction there. Left unaddressed for now (per decision to avoid
 architecture changes beyond what's necessary) since it does not affect boundary-adjacent
-pixels, which is what matters for the region-splitting use case discussed in the tutor
+pixels, which is what matters for the region-splitting use case discussed in the tutors
 meeting.
 
 ---
@@ -835,3 +835,95 @@ co-adapt with it. The article's own architecture trains all branches jointly wit
 active throughout, allowing mutual gradient flow. Next test: joint line+point training
 with SCE active and *not* frozen, to check whether it is this co-adaptation — rather than
 guide quality alone — that the frozen setup was missing.
+
+---
+
+### Run7 — `all_raster`: mask+line+point trained jointly, SCE active, no freeze (150 epochs, complete)
+
+Config: `PLR-Net_branch_all_raster.yaml`, `ACTIVE_BRANCH="all_raster"`. All 3 branches
+train together on raster GT (`gt_region`, `gt_afm`, `gt_nodes`), SCE cross-attention active
+for both mask and jloc (as in `"all"`), nothing frozen. `loss_joff` stays at 0 — `gt_nodes`
+has no sub-pixel corner offset to learn from (already rounded to the pixel grid).
+
+| Epoch | region IoU | line precision | line recall | point precision | point recall |
+|-------|-----------|-----------------|-------------|-------------------|---------------|
+| 5   | 0.724 | 0.358 | 0.056 | 0.071 | 0.816 |
+| 50  | 0.758 | 0.574 | 0.216 | 0.085 | 0.850 |
+| 100 | 0.777 | 0.565 | 0.302 | 0.087 | 0.865 |
+| 150 | 0.785 | 0.558 | 0.290 | 0.090 | 0.860 |
+
+**Diagnosis:** Region IoU (0.785) is on par with the isolated region runs. Line precision
+(0.558) is close to Run5 isolated, but line recall (0.290) is lower than Run5's late-epoch
+value (0.486). Point precision/recall (0.090 / 0.860) is essentially unchanged from every
+previous point experiment (Run2 isolated: 0.07–0.09 / 0.85; Run4 and Run6 `point_sce`: same
+range). Visually, the point prediction map is still indistinguishable from the line
+prediction map — the network keeps outputting a boundary-proximity signal instead of
+isolated corners (see `inspect_branch_raster/all_raster/`).
+
+**Conclusion:** neither a frozen guide (Run4, Run6) nor full joint training with SCE active
+(Run7) changes the point branch's over-detection behavior. Class rebalancing (Run3), guide
+quality (Run6), and gradient co-adaptation (Run7) have all been tested and ruled out as the
+fix. Point precision at the raw pixel level looks like a structural limitation rather than
+a training-setup issue — moving to the post-processing stage discussed with my tutors
+(region + line used to clean up the point predictions per parcel) rather than continuing to
+search for a training fix.
+
+---
+
+## Post-processing: per-parcel point simplification
+
+The model now outputs region, line, and point predictions from a single `all_raster`
+checkpoint. Following the plan discussed with my tutors: split the region mask into
+parcels using the line contours, assign each detected point to its parcel, then merge
+nearby points inside each parcel before vectorizing.
+
+### `postprocess_parcels.py`
+
+New script (`scripts/postprocess_parcels.py`), built on top of `inspect_branch_raster.py`'s
+model-loading and prediction helpers. Three steps:
+
+1. **Parcel labeling** — `region_prob > 0.5 AND NOT (line_prob > 0.5)`, then
+   `skimage.measure.label` (4-connectivity) to get individual parcel IDs. Plain connected
+   components, not watershed — chosen as the simpler starting point, to measure how much of
+   a problem incomplete contours actually are before adding complexity.
+2. **Point assignment** — every point candidate (`point_prob > 0.5`) is looked up in the
+   parcel label map at its own pixel location and tagged with that parcel's ID.
+3. **Per-parcel simplification** — within each parcel, points closer than 5px
+   (`scipy.cluster.hierarchy.fclusterdata`) are merged into their centroid.
+
+```bash
+/mnt/DATA/IMANE/ai4sf/bin/python scripts/postprocess_parcels.py \
+    --config     config-files/PLR-Net_branch_all_raster.yaml \
+    --checkpoint <path to all_raster checkpoint>/best_val_loss.pth \
+    --output     /home/imane/DATA/PLR-Net_output/postprocess_parcels
+```
+
+### First results (Run7 checkpoint, 6 val patches)
+
+| Patch | parcels | raw points | simplified points | reduction |
+|-------|---------|------------|--------------------|-----------|
+| z1_r005330_c006150 | 218 | 11063 | 210 | ~98% |
+| z1_r002255_c008405 | 392 | 16416 | 430 | ~97% |
+| z2_r010865_c003895 | 629 | 6822  | 400 | ~94% |
+| z2_r006355_c010045 | 349 | 13094 | 334 | ~97% |
+| z1_r006970_c009225 | 310 | 14012 | 459 | ~97% |
+| z2_r009020_c006355 | 246 | 13824 | 292 | ~95% |
+
+**Diagnosis:** The simplified point count lands close to the parcel count on every patch
+(~1–1.5 points per parcel), and the point-count reduction is drastic (94–98%) — the
+per-parcel clustering does what it's meant to. Visual inspection of the parcel-label maps
+and simplified points (`postprocess_parcels/`) confirms the large-scale structure matches
+the true parcel layout well, and simplified points fall close to real visible boundaries
+rather than being scattered at random.
+
+Two error modes observed, both traceable to line-branch quality rather than the
+post-processing logic itself:
+- **Over-segmentation** on patches where the line branch's known grid-artifact noise (see
+  Run5) creates spurious small cuts inside otherwise-uniform parcels
+  (`NL_train_z1_r002255_c008405.png`: 392 parcels, visibly more fragmented than the true
+  layout).
+- **Under-segmentation** where the line branch misses a true boundary (consistent with its
+  recall being well under 1), leaving two adjacent real parcels merged into one label
+  (`NL_train_z2_r006355_c010045.png`, top region).
+
+**Next step:** vectorization of the per-parcel simplified point sets into polygons.

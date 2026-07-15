@@ -238,9 +238,16 @@ class RasterGTDataset(Dataset):
         'point_sce': 'gt_nodes',  # same target as "point", just with frozen-line SCE guidance
     }
 
+    # -------------------------------------------------------------------
+    # ADDED: "all_raster" trains mask+line+point together (SCE active, no
+    # freeze) on raster GT instead of COCO — loads all 3 binary rasters
+    # plus gt_afm at once instead of a single GT_SUBDIRS entry.
+    # -------------------------------------------------------------------
+    ALL_RASTER_BRANCH = 'all_raster'
+
     def __init__(self, root, active_branch, transform=None, rotate_f=None,
                  stems_file=None, augment=True):
-        assert active_branch in ('region', 'line', 'point', 'point_sce'), \
+        assert active_branch in ('region', 'line', 'point', 'point_sce', self.ALL_RASTER_BRANCH), \
             f"RasterGTDataset only supports single-branch training, got {active_branch!r}"
         self.root = root
         self.active_branch = active_branch
@@ -282,11 +289,6 @@ class RasterGTDataset(Dataset):
         np.nan_to_num(image, nan=0.0, copy=False)
         height, width = image.shape[0], image.shape[1]
 
-        gt_subdir = self.GT_SUBDIRS[self.active_branch]
-        gt_path = osp.join(self.root, gt_subdir, stem + '.tif')
-        gt_raster = self._read_tif(gt_path)
-        gt_raster = np.clip(gt_raster, 0.0, 1.0)
-
         ann = {
             'width': width,
             'height': height,
@@ -296,15 +298,32 @@ class RasterGTDataset(Dataset):
             'gt_lines':  np.zeros((height, width), dtype=np.float32),
             'gt_nodes':  np.zeros((height, width), dtype=np.float32),
         }
-        ann['gt_' + self.GT_SUBDIRS[self.active_branch][3:]] = gt_raster
 
         # -------------------------------------------------------------------
-        # ADDED: line branch needs the 2-band (dx,dy) AFM target,
-        # precomputed by build_gt_rasters_from_brp.py via afm_op
+        # ADDED: all_raster loads all 3 binary rasters + gt_afm at once
+        # (mask+line+point trained together); isolated branches still load
+        # only the one raster their GT_SUBDIRS entry points to.
         # -------------------------------------------------------------------
-        if self.active_branch == 'line':
+        if self.active_branch == self.ALL_RASTER_BRANCH:
+            binary_keys = ['gt_region', 'gt_lines', 'gt_nodes']
+            for key in binary_keys:
+                subdir = key[3:]  # 'gt_region' -> 'region', etc. matches folder names
+                gt_path = osp.join(self.root, 'gt_' + subdir, stem + '.tif')
+                ann[key] = np.clip(self._read_tif(gt_path), 0.0, 1.0)
             afm_path = osp.join(self.root, 'gt_afm', stem + '.tif')
             ann['gt_afm'] = self._read_tif_multiband(afm_path)
+        else:
+            gt_subdir = self.GT_SUBDIRS[self.active_branch]
+            gt_path = osp.join(self.root, gt_subdir, stem + '.tif')
+            gt_raster = np.clip(self._read_tif(gt_path), 0.0, 1.0)
+            binary_keys = ['gt_' + gt_subdir[3:]]
+            ann[binary_keys[0]] = gt_raster
+
+            # line branch needs the 2-band (dx,dy) AFM target, precomputed
+            # by build_gt_rasters_from_brp.py via afm_op
+            if self.active_branch == 'line':
+                afm_path = osp.join(self.root, 'gt_afm', stem + '.tif')
+                ann['gt_afm'] = self._read_tif_multiband(afm_path)
 
         # ADDED: augment=False forces reminder=0 (no flip/rotate at all),
         # needed for deterministic validation — the rotate_f branch alone
@@ -318,25 +337,32 @@ class RasterGTDataset(Dataset):
         ann['reminder'] = reminder
 
         # flip/copy: fliplr/flipud return negative-stride views, which
-        # torch.from_numpy (called later in ToTensor) cannot handle
-        gt_key = 'gt_' + gt_subdir[3:]
+        # torch.from_numpy (called later in ToTensor) cannot handle.
+        # Every binary GT raster in play (1 for isolated branches, 3 for
+        # all_raster) gets the same transform as the image, so they stay
+        # pixel-aligned with each other.
         if reminder == 1:
             image = image[:, ::-1, :].copy()
-            ann[gt_key] = np.fliplr(ann[gt_key]).copy()
+            for key in binary_keys:
+                ann[key] = np.fliplr(ann[key]).copy()
         elif reminder == 2:
             image = image[::-1, :, :].copy()
-            ann[gt_key] = np.flipud(ann[gt_key]).copy()
+            for key in binary_keys:
+                ann[key] = np.flipud(ann[key]).copy()
         elif reminder == 3:
             image = image[::-1, ::-1, :].copy()
-            ann[gt_key] = np.fliplr(np.flipud(ann[gt_key])).copy()
+            for key in binary_keys:
+                ann[key] = np.fliplr(np.flipud(ann[key])).copy()
         elif reminder == 4:
             rot_matrix = cv2.getRotationMatrix2D((width / 2, height / 2), 90, 1)
             image = cv2.warpAffine(image, rot_matrix, (width, height))
-            ann[gt_key] = cv2.warpAffine(ann[gt_key], rot_matrix, (width, height))
+            for key in binary_keys:
+                ann[key] = cv2.warpAffine(ann[key], rot_matrix, (width, height))
         elif reminder == 5:
             rot_matrix = cv2.getRotationMatrix2D((width / 2, height / 2), 270, 1)
             image = cv2.warpAffine(image, rot_matrix, (width, height))
-            ann[gt_key] = cv2.warpAffine(ann[gt_key], rot_matrix, (width, height))
+            for key in binary_keys:
+                ann[key] = cv2.warpAffine(ann[key], rot_matrix, (width, height))
 
         # -------------------------------------------------------------------
         # ADDED: gt_afm holds (dx,dy) vectors, not a plain raster — flipping

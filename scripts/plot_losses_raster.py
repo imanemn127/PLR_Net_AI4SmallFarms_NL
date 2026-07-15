@@ -36,7 +36,19 @@ ACTIVE_LOSSES_BY_BRANCH = {
     "line":      ["loss_afm"],    # afm_predictor (2ch dx/dy) + MAE against gt_afm (afm_op)
     "point":     ["loss_jloc", "loss_joff"],
     "point_sce": ["loss_jloc", "loss_joff"],  # same losses as "point", afm_head is frozen (no loss_afm)
+    # ADDED: mask+line+point trained together, SCE active, no freeze — see detector.py forward_train
+    "all_raster": ["loss_jloc", "loss_mask", "loss_afm", "loss_remask"],  # loss_joff stays 0 (no sub-pixel GT)
 }
+
+# ADDED: for all_raster, one metric panel per sub-branch instead of a
+# single one — mirrors ALL_RASTER_SUBBRANCHES in scripts/train.py
+ALL_RASTER_METRIC_PANELS = [
+    ("region", "iou",             [("region_iou", "#2ca02c", "Val IoU")]),
+    ("line",   "precision_recall", [("line_precision", "#d62728", "Precision"),
+                                     ("line_recall",    "#1f77b4", "Recall")]),
+    ("point",  "precision_recall", [("point_precision", "#d62728", "Precision"),
+                                     ("point_recall",    "#1f77b4", "Recall")]),
+]
 
 BASE_DIR = "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp_raster"
 
@@ -68,7 +80,7 @@ def main():
     )
     parser.add_argument("run_dir", nargs="?", default=None,
                         help="Run folder containing metrics.csv. If omitted, latest run is used.")
-    parser.add_argument("--branch", choices=["region", "line", "point", "point_sce"], default=None,
+    parser.add_argument("--branch", choices=["region", "line", "point", "point_sce", "all_raster"], default=None,
                         help="Force branch type (else auto-detected from config.yml).")
     args = parser.parse_args()
 
@@ -90,21 +102,27 @@ def main():
     print(f"Branch: {branch}")
 
     df = pd.read_csv(csv_path, na_values=["", " "])
+    # ADDED: all_raster metric columns are prefixed per sub-branch
+    # (region_iou, line_precision, line_recall, point_precision, point_recall)
+    # instead of the generic val_iou / val_precision / val_recall
+    metric_cols = (["val_" + m for _, _, panel in ALL_RASTER_METRIC_PANELS for m, _, _ in panel]
+                   if branch == "all_raster" else ["val_iou", "val_precision", "val_recall"])
     numeric_cols = ["epoch", "train_loss", "val_loss"] + \
                    ["w_" + k for k in LOSS_NAMES] + \
                    ["val_w_" + k for k in LOSS_NAMES] + \
-                   ["val_iou", "val_precision", "val_recall"]
+                   metric_cols
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     val_df = df.dropna(subset=["val_loss"])
 
-    # -------- layout: 3 subplots --------
+    # -------- layout --------
     #   [0] Total loss (train vs val)
     #   [1] Individual train losses (only the active branch's losses are non-zero)
-    #   [2] Branch metric: IoU (region) or precision/recall (line/point)
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    #   [2..] Branch metric(s): 1 panel normally, 3 panels (region/line/point) for all_raster
+    n_metric_panels = len(ALL_RASTER_METRIC_PANELS) if branch == "all_raster" else 1
+    fig, axes = plt.subplots(1, 2 + n_metric_panels, figsize=(6 * (2 + n_metric_panels), 5))
 
     # --- subplot 0 : total loss train vs val ---
     ax = axes[0]
@@ -133,31 +151,50 @@ def main():
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
 
-    # --- subplot 2 : branch-specific metric ---
-    ax = axes[2]
-    if branch == "region":
-        if "val_iou" in df.columns:
-            sub = df.dropna(subset=["val_iou"])
-            if len(sub):
-                ax.plot(sub["epoch"], sub["val_iou"], color="#2ca02c", linewidth=1.4,
-                        marker="o", markersize=4, label="Val IoU")
-                ax.set_ylim(0, 1)
-        ax.set_ylabel("IoU")
-        ax.set_title("Val Mask IoU (region branch)")
+    # --- subplot(s) 2.. : branch-specific metric(s) ---
+    # ADDED: all_raster gets one panel per sub-branch (region/line/point);
+    # every other branch keeps its single metric panel as before.
+    if branch == "all_raster":
+        for i, (name, kind, series) in enumerate(ALL_RASTER_METRIC_PANELS):
+            ax = axes[2 + i]
+            for col, color, label in series:
+                full_col = "val_" + col
+                if full_col in df.columns:
+                    sub = df.dropna(subset=[full_col])
+                    if len(sub):
+                        ax.plot(sub["epoch"], sub[full_col], color=color, linewidth=1.4,
+                                marker="o", markersize=4, label=label)
+            ax.set_ylim(0, 1)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("IoU" if kind == "iou" else "Score")
+            ax.set_title(f"Val {'IoU' if kind == 'iou' else 'Precision/Recall'} ({name} branch)")
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
     else:
-        for col, color, label in [("val_precision", "#d62728", "Precision"),
-                                   ("val_recall", "#1f77b4", "Recall")]:
-            if col in df.columns:
-                sub = df.dropna(subset=[col])
+        ax = axes[2]
+        if branch == "region":
+            if "val_iou" in df.columns:
+                sub = df.dropna(subset=["val_iou"])
                 if len(sub):
-                    ax.plot(sub["epoch"], sub[col], color=color, linewidth=1.4,
-                            marker="o", markersize=4, label=label)
-        ax.set_ylim(0, 1)
-        ax.set_ylabel("Score")
-        ax.set_title(f"Val Precision/Recall ({branch} branch)")
-    ax.set_xlabel("Epoch")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
+                    ax.plot(sub["epoch"], sub["val_iou"], color="#2ca02c", linewidth=1.4,
+                            marker="o", markersize=4, label="Val IoU")
+                    ax.set_ylim(0, 1)
+            ax.set_ylabel("IoU")
+            ax.set_title("Val Mask IoU (region branch)")
+        else:
+            for col, color, label in [("val_precision", "#d62728", "Precision"),
+                                       ("val_recall", "#1f77b4", "Recall")]:
+                if col in df.columns:
+                    sub = df.dropna(subset=[col])
+                    if len(sub):
+                        ax.plot(sub["epoch"], sub[col], color=color, linewidth=1.4,
+                                marker="o", markersize=4, label=label)
+            ax.set_ylim(0, 1)
+            ax.set_ylabel("Score")
+            ax.set_title(f"Val Precision/Recall ({branch} branch)")
+        ax.set_xlabel("Epoch")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     out_path = os.path.join(run_dir, "loss_curves_raster.png")
