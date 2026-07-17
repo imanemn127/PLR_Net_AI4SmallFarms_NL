@@ -34,6 +34,7 @@ import numpy as np
 import torch
 from scipy.cluster.hierarchy import fclusterdata
 from skimage.measure import label
+from skimage.morphology import dilation, remove_small_objects
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -45,15 +46,29 @@ REGION_THRESHOLD  = 0.5
 LINE_THRESHOLD    = 0.5
 POINT_THRESHOLD   = 0.5
 CLUSTER_DIST_PX   = 5.0
+LINE_DILATE_PX    = 1    # closes small gaps in the 1px predicted contour
+MIN_PARCEL_PX     = 20   # drops slivers cut off by line-branch noise
 
 
 def label_parcels(region_prob, line_prob):
     """region_prob, line_prob: (H,W) float arrays in [0,1].
-    Returns an (H,W) int label map: 0 = background, 1..N = parcel id."""
+    Returns an (H,W) int label map: 0 = background, 1..N = parcel id.
+
+    gt_lines (and the predicted line map) is a 1px-thin contour — a single
+    missed pixel reconnects two real parcels, and a single spurious pixel
+    cuts off a fake sliver. Dilating the contour before cutting closes small
+    gaps; dropping small connected components after labeling removes the
+    slivers.
+    """
     region_bin = region_prob > REGION_THRESHOLD
     line_bin   = line_prob > LINE_THRESHOLD
+    if LINE_DILATE_PX > 0:
+        footprint = np.ones((2 * LINE_DILATE_PX + 1,) * 2, dtype=bool)
+        line_bin = dilation(line_bin, footprint=footprint)
     cut = region_bin & ~line_bin
-    return label(cut, connectivity=1)
+    labels = label(cut, connectivity=1)
+    labels = remove_small_objects(labels, max_size=MIN_PARCEL_PX)
+    return labels
 
 
 def extract_point_candidates(point_prob):

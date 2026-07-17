@@ -926,4 +926,69 @@ post-processing logic itself:
   recall being well under 1), leaving two adjacent real parcels merged into one label
   (`NL_train_z2_r006355_c010045.png`, top region).
 
-**Next step:** vectorization of the per-parcel simplified point sets into polygons.
+### Root cause of the over-segmentation, and a fix
+
+`gt_lines` (and the predicted line map) is a **1px-thin contour**. A single spurious
+foreground pixel predicted in the middle of an otherwise uniform parcel — the grid-artifact
+noise noted in Run5 — is enough to cut a 1-pixel sliver off the rest of the parcel in
+`connected components`. Checked directly on `NL_train_z2_r010865_c003895`: the raw labeling
+produced 310 "parcels", 87% of them under 20px, **median size 1 pixel** — almost all noise,
+not real parcels.
+
+Fix applied in `label_parcels()`: dilate the predicted line contour by 1px
+(`skimage.morphology.dilation`, closes small gaps from imperfect recall) before cutting the
+region mask, then drop connected components ≤ 20px (`remove_small_objects`) — removes the
+slivers that survive the dilation.
+
+| Patch | parcels before | parcels after | reduction |
+|-------|-----------------|----------------|-----------|
+| z1_r005330_c006150 | 218 | 126 | -42% |
+| z1_r002255_c008405 | 392 | 241 | -39% |
+| z2_r010865_c003895 | 629 | 124 | **-80%** |
+| z2_r006355_c010045 | 349 | 176 | -50% |
+| z1_r006970_c009225 | 310 | 117 | -62% |
+| z2_r009020_c006355 | 246 | 146 | -41% |
+
+**Diagnosis:** the fix helps everywhere, but its effectiveness is uneven. On
+`z2_r010865_c003895` — one large, internally homogeneous parcel scarred by scattered
+grid-artifact noise — the fix nearly cleans it up (629 → 124, the block that was full of
+tiny holes becomes one coherent region). On `z1_r002255_c008405`, the reduction is much
+smaller (392 → 241) and the map still shows far more parcels than what the RGB image
+suggests — dilation alone is not enough there. Not yet determined whether the remaining
+noise on that patch comes from the region branch or the line branch specifically; a single
+fixed dilation radius cannot be optimal in both regimes (it closes real gaps in one case
+and merges/misses real closely-spaced boundaries in the other), which is an argument for
+revisiting `gt_lines` itself (thicker contour, retrained) rather than tuning post-processing
+further.
+
+---
+
+## Vectorization into polygons
+
+`scripts/vectorize_parcels.py` turns each cleaned-up parcel label into a polygon:
+
+1. **Contour extraction** — `cv2.findContours` on the parcel's binary mask. Working from the
+   mask outline rather than the point cloud, since it naturally handles concave shapes.
+2. **Simplification** — `cv2.approxPolyDP` (Douglas-Peucker, 2px tolerance) to keep only
+   meaningful vertices instead of one per boundary pixel.
+3. The per-parcel simplified points from `postprocess_parcels.py` are drawn on top of the
+   output figure for visual comparison only — they do not feed into the polygon itself.
+
+```bash
+/mnt/DATA/IMANE/ai4sf/bin/python scripts/vectorize_parcels.py \
+    --config     config-files/PLR-Net_branch_all_raster.yaml \
+    --checkpoint <path to all_raster checkpoint>/best_val_loss.pth \
+    --output     /home/imane/DATA/PLR-Net_output/vectorize_parcels
+```
+
+**Diagnosis (Run7 checkpoint, cleaned-up labels, 6 val patches):** the overall pipeline
+(parcel → contour → simplified polygon) produces plausible-looking output — polygons follow
+real field boundaries, roads, and buildings visible in the RGB image, and on inspection the
+point-branch corners (overlaid, not used to build the polygons) frequently land close to
+real polygon vertices despite the point branch's poor raw pixel-level precision. Remaining
+issues visible on inspection: zigzag edges where a real straight boundary should be, a few
+spurious thin sliver shapes (likely surviving noise not caught by the 20px area filter,
+which does not check shape), and some adjacent real parcels still fused into a single
+polygon where the line branch missed a boundary.
+
+**Next steps:** 
