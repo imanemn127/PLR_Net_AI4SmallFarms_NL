@@ -33,8 +33,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from scipy.cluster.hierarchy import fclusterdata
+from skimage.filters import apply_hysteresis_threshold
 from skimage.measure import label
-from skimage.morphology import dilation, remove_small_objects
+from skimage.morphology import remove_small_objects, skeletonize
+from skimage.segmentation import watershed
+from scipy.ndimage import maximum_filter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -43,10 +46,10 @@ from PLRNet.detector import BuildingDetector
 from inspect_branch_raster import run_branch, load_patch, load_gt, ALL_RASTER_SUBBRANCHES
 
 REGION_THRESHOLD  = 0.5
-LINE_THRESHOLD    = 0.5
 POINT_THRESHOLD   = 0.5
 CLUSTER_DIST_PX   = 5.0
-LINE_DILATE_PX    = 1    # closes small gaps in the 1px predicted contour
+LINE_HYST_LOW     = 0.15  # hysteresis low threshold — reconnects weak-but-real contour pixels
+LINE_HYST_HIGH    = 0.38  # hysteresis high threshold — seeds must be confident contour pixels
 MIN_PARCEL_PX     = 20   # drops slivers cut off by line-branch noise
 
 
@@ -54,20 +57,26 @@ def label_parcels(region_prob, line_prob):
     """region_prob, line_prob: (H,W) float arrays in [0,1].
     Returns an (H,W) int label map: 0 = background, 1..N = parcel id.
 
-    gt_lines (and the predicted line map) is a 1px-thin contour — a single
-    missed pixel reconnects two real parcels, and a single spurious pixel
-    cuts off a fake sliver. Dilating the contour before cutting closes small
-    gaps; dropping small connected components after labeling removes the
-    slivers.
+    NMS keep only local maxima of line_prob, drops diffuse noise before thresholding.
+    Hysteresis rejects isolated low-confidence noise while still reconnecting
+    weak-but-real contour stretches, unlike a single fixed threshold.
+    skeletonize restores the 1px width lost to hysteresis growing the contour
+    into a blob.
     """
     region_bin = region_prob > REGION_THRESHOLD
-    line_bin   = line_prob > LINE_THRESHOLD
-    if LINE_DILATE_PX > 0:
-        footprint = np.ones((2 * LINE_DILATE_PX + 1,) * 2, dtype=bool)
-        line_bin = dilation(line_bin, footprint=footprint)
+    
+    #local_max = (line_prob == maximum_filter(line_prob, size=3))
+    #line_prob_nms = np.where(local_max, line_prob, 0.0)
+    
+    line_hyst  = apply_hysteresis_threshold(line_prob, LINE_HYST_LOW, LINE_HYST_HIGH)
+    
+    line_bin   = skeletonize(line_hyst)
+   
     cut = region_bin & ~line_bin
     labels = label(cut, connectivity=1)
     labels = remove_small_objects(labels, max_size=MIN_PARCEL_PX)
+    
+    labels = watershed(line_prob, markers=labels, mask=region_bin)
     return labels
 
 

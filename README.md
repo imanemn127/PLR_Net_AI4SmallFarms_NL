@@ -991,4 +991,112 @@ spurious thin sliver shapes (likely surviving noise not caught by the 20px area 
 which does not check shape), and some adjacent real parcels still fused into a single
 polygon where the line branch missed a boundary.
 
-**Next steps:** 
+**Next steps:** revisit `label_parcels()` itself (see below) rather than tune the polygon
+simplification tolerance further — a cleaner parcel mask upstream should reduce slivers and
+fusions before they reach vectorization.
+
+---
+
+## `label_parcels()` v2: hysteresis thresholding + watershed
+
+The fixed threshold + dilation approach above could not be optimal on both large
+homogeneous parcels (scattered noise) and dense mixed zones (real boundaries close
+together) at the same time. Replaced with hysteresis thresholding, then watershed with
+markers.
+
+### Threshold calibration (`scripts/calibr_seuil_hyst.py`)
+
+Loads the `all_raster` checkpoint (Run7, epoch 100) and runs inference on every patch in
+`val.txt` (1,389 patches), splitting predicted `line_prob` into two populations via
+`gt_lines`: `fg` (pixels on a true contour) and `bg` (pixels >5px from any true contour,
+via `distance_transform_edt`).
+
+| | p50 | p95 | p99 |
+|---|---|---|---|
+| fg (true contours) | median 0.368 | p95 0.667 | p5=0.006 |
+| bg (true background) | 0.026 | 0.174 | 0.378 |
+
+bg's p99 (0.378) is almost equal to fg's median (0.368) — background noise and weak true
+contours overlap structurally. No single fixed threshold can separate them cleanly for this
+checkpoint. `HIGH=0.38` picked just above bg's p99.
+
+### Hysteresis thresholding + skeletonize
+
+```python
+line_hyst = apply_hysteresis_threshold(line_prob, LINE_HYST_LOW, LINE_HYST_HIGH)
+line_bin  = skeletonize(line_hyst)
+```
+
+`LOW` tested at 0.1 and 0.15 on the usual 6 validation patches:
+
+| LOW | Result |
+|---|---|
+| 0.1 | Severe over-segmentation: 1,120–3,050 parcels/patch (vs. 117–241 with dilation) |
+| 0.15 | Only 11–16% fewer parcels than LOW=0.1 — still far above the ~100–200 target |
+
+Visual check: LOW=0.15 clearly improves large homogeneous parcels (clean, contiguous
+blocks matching RGB) but stays noisy on dense mixed zones.
+
+### NMS before hysteresis — rejected
+
+```python
+local_max = (line_prob == maximum_filter(line_prob, size=3))
+line_prob_nms = np.where(local_max, line_prob, 0.0)
+```
+
+Parcel counts dropped a lot (17–54/patch) but this was false progress: a 3×3 isotropic
+max filter can't tell a real faint contour from an isolated noise peak — both can survive
+or get erased depending only on their immediate neighborhood. Several real adjacent
+parcels, clearly separated on the RGB image, ended up merged under one label. Rejected.
+
+### Watershed with markers — adopted
+
+Use the hysteresis+skeletonize result (LOW=0.15) as markers for a watershed on `line_prob`
+directly (already shaped like ridges on true contours, no sign flip needed), constrained
+by `mask=region_bin` so basins never spill into non-agricultural background:
+
+```python
+region_bin = region_prob > REGION_THRESHOLD
+line_hyst  = apply_hysteresis_threshold(line_prob, LINE_HYST_LOW, LINE_HYST_HIGH)
+line_bin   = skeletonize(line_hyst)
+cut        = region_bin & ~line_bin
+labels     = label(cut, connectivity=1)
+labels     = remove_small_objects(labels, max_size=MIN_PARCEL_PX)  # clean markers first
+labels     = watershed(line_prob, markers=labels, mask=region_bin)
+```
+
+Unlike NMS, watershed with markers grows already-trusted regions into unlabeled territory
+instead of deciding pixel-by-pixel — a better fit since the failure mode is real parcels
+lost to background, not just noise to filter out.
+
+**Result on the 6 validation patches** (LOW=0.15, HIGH=0.38, no NMS):
+
+| Patch | Type | n_parcels | n_simplified points | Visual quality |
+|---|---|---|---|---|
+| z2_r010865_c003895 | large homogeneous parcels | 2150 | 426 | Very good — clean blocks matching RGB |
+| z2_r006355_c010045 | known under-segmentation case | 2178 | 396 | Good — sharp cuts along real boundaries |
+| z1_r006970_c009225 | fine mesh, small parcels | 2289 | 510 | Good, some residual speckle |
+| z2_r009020_c006355 | mixed peri-urban | 1865 | 374 | Good — background correctly excluded |
+| z1_r005330_c006150 | dense urban/built | 992 | 141 | Good — black area matches real non-agricultural ground |
+| z1_r002255_c008405 | dense mixed built/agricultural | 2663 | 479 | Weakest of the 6, still improved vs. every earlier attempt |
+
+`n_parcels` can't change between markers and post-watershed result — watershed only grows
+existing labels into unlabeled area, never creates or merges labels. The simplified point
+count is the more telling number here: much higher than LOW=0.15 alone, consistent with
+more of the previously-unlabeled area now being correctly assigned to a real parcel
+instead of dropped as background.
+
+**Best configuration found so far**, across dilation, hysteresis alone, NMS+hysteresis,
+and hysteresis+watershed. 5 of 6 patches look clean and RGB-consistent. Dense mixed
+built/agricultural stays the weakest regime but no longer shows the severe noise of plain
+thresholding or the severe under-segmentation of NMS. Not yet re-validated beyond these 6
+patches.
+
+**Open question:** log-transform `line_prob` before thresholding? Values are compressed
+near 0 (bg p95=0.174), making it hard to tell weak noise (~0.02) from a weak true contour
+(~0.10) apart. For the hysteresis step this is expected to be a no-op — a monotonic
+transform doesn't change which pixels land above/below a threshold pair, so the
+already-calibrated `LOW`/`HIGH` should give the same mask in log space. Watershed is
+shape-sensitive though (reacts to the ridge profile, not just pixel order), so log could
+plausibly change basin boundaries there. To test next, on the weakest patch
+(`z1_r002255_c008405`) before deciding whether to generalize.
