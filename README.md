@@ -1100,11 +1100,21 @@ built/agricultural stays the weakest regime but no longer shows the severe noise
 thresholding or the severe under-segmentation of NMS. Not yet re-validated beyond these 6
 patches.
 
-**Open question:** log-transform `line_prob` before thresholding? Values are compressed
-near 0 (bg p95=0.174), making it hard to tell weak noise (~0.02) from a weak true contour
-(~0.10) apart. For the hysteresis step this is expected to be a no-op — a monotonic
-transform doesn't change which pixels land above/below a threshold pair, so the
-already-calibrated `LOW`/`HIGH` should give the same mask in log space. Watershed is
-shape-sensitive though (reacts to the ridge profile, not just pixel order), so log could
-plausibly change basin boundaries there. To test next, on the weakest patch
-(`z1_r002255_c008405`) before deciding whether to generalize.
+### Log-transform of `line_prob` — tested, no effect
+
+`line_prob` is compressed near 0, so a log-transform (+ eps, shifted
+back to positive) might separate weak noise from weak true contours better.
+
+Tried two things:
+1. Log only on the watershed input, thresholds left linear. Result: output images
+   byte-identical to the linear version. `skimage`'s watershed only uses the relative
+   order of pixel values, and log doesn't change that order — so it can't change anything.
+2. Recalibrated `LOW`/`HIGH` from scratch on log-transformed values (reran
+   `calibr_seuil_hyst.py` on `log(line_prob)`). Same overlap between noise and weak
+   contours as in linear space (bg p99 ≈ fg median). Percentiles depend only on value
+   order too, so same reason — no change.
+
+**Conclusion:** log-transform doesn't help here, for both steps, for the same underlying
+reason (everything used is invariant to a monotonic transform). The noise/signal overlap
+is a real limit of what the line branch predicts, not a scale issue. Dropped from
+`label_parcels()`.

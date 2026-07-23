@@ -7,7 +7,9 @@ contours, assigns each detected point to its parcel, then merges points
 that are close together within the same parcel.
 
 Steps:
-  1. region_bin AND NOT line_bin -> connected components -> parcel labels
+  1. hysteresis-threshold + skeletonize line_prob, cut region_bin along
+     it -> connected components -> parcel seeds; watershed over line_prob
+     grows the seeds to recover parcels lost to background
   2. each point candidate (point_prob > POINT_THRESHOLD) gets the label
      of the parcel it falls on
   3. within each parcel, cluster points closer than CLUSTER_DIST_PX and
@@ -37,7 +39,6 @@ from skimage.filters import apply_hysteresis_threshold
 from skimage.measure import label
 from skimage.morphology import remove_small_objects, skeletonize
 from skimage.segmentation import watershed
-from scipy.ndimage import maximum_filter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -52,22 +53,18 @@ LINE_HYST_LOW     = 0.15  # hysteresis low threshold — reconnects weak-but-rea
 LINE_HYST_HIGH    = 0.38  # hysteresis high threshold — seeds must be confident contour pixels
 MIN_PARCEL_PX     = 20   # drops slivers cut off by line-branch noise
 
-
 def label_parcels(region_prob, line_prob):
     """region_prob, line_prob: (H,W) float arrays in [0,1].
     Returns an (H,W) int label map: 0 = background, 1..N = parcel id.
-
-    NMS keep only local maxima of line_prob, drops diffuse noise before thresholding.
     Hysteresis rejects isolated low-confidence noise while still reconnecting
     weak-but-real contour stretches, unlike a single fixed threshold.
     skeletonize restores the 1px width lost to hysteresis growing the contour
-    into a blob.
+    into a blob. The resulting labels seed a watershed over line_prob, growing
+    each seed until it meets another seed or the region_prob mask — recovers
+    real parcels that hysteresis alone left unlabeled.
     """
     region_bin = region_prob > REGION_THRESHOLD
-    
-    #local_max = (line_prob == maximum_filter(line_prob, size=3))
-    #line_prob_nms = np.where(local_max, line_prob, 0.0)
-    
+        
     line_hyst  = apply_hysteresis_threshold(line_prob, LINE_HYST_LOW, LINE_HYST_HIGH)
     
     line_bin   = skeletonize(line_hyst)
@@ -75,7 +72,7 @@ def label_parcels(region_prob, line_prob):
     cut = region_bin & ~line_bin
     labels = label(cut, connectivity=1)
     labels = remove_small_objects(labels, max_size=MIN_PARCEL_PX)
-    
+
     labels = watershed(line_prob, markers=labels, mask=region_bin)
     return labels
 
