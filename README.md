@@ -1080,6 +1080,14 @@ lost to background, not just noise to filter out.
 | z1_r005330_c006150 | dense urban/built | 992 | 141 | Good — black area matches real non-agricultural ground |
 | z1_r002255_c008405 | dense mixed built/agricultural | 2663 | 479 | Weakest of the 6, still improved vs. every earlier attempt |
 
+Best case (`z2_r010865_c003895` — large homogeneous parcels):
+
+![Hysteresis + watershed, best case](docs/img/hysteresis_watershed_best_case.png)
+
+Weakest case (`z1_r002255_c008405` — dense mixed built/agricultural):
+
+![Hysteresis + watershed, weakest case](docs/img/hysteresis_watershed_weakest_case.png)
+
 `n_parcels` can't change between markers and post-watershed result — watershed only grows
 existing labels into unlabeled area, never creates or merges labels. The simplified point
 count is the more telling number here: much higher than LOW=0.15 alone, consistent with
