@@ -37,20 +37,42 @@ from postprocess_parcels import label_parcels, extract_point_candidates, assign_
 
 DP_EPSILON_PX = 2.0
 MIN_PARCEL_AREA_PX = 20  # drop slivers too small to be a real parcel
+SNAP_DIST_PX=5.0
+
+def min_dist_to_points(vertex, points):
+    """vertex: (2,) array (x,y). points: (M,2) array. Returns the distance to the closest point, or inf if points is empty."""
+    if len(points) == 0:
+        return np.inf
+    dists = np.sqrt(((points - vertex) ** 2).sum(axis=1))
+    return dists.min()
 
 
-def vectorize_parcel(mask, epsilon_px=DP_EPSILON_PX):
-    """mask: (H,W) bool array for one parcel. Returns (N,2) polygon vertices
-    in (x,y) pixel coords, or None if the mask has no valid contour."""
+def vectorize_parcel(mask, parcel_points, epsilon_px=DP_EPSILON_PX, snap_dist_px=SNAP_DIST_PX):
+    """mask: (H,W) bool array for one parcel. parcel_points: (M,2) array of
+    point-branch corners assigned to this parcel (possibly empty).
+    Returns (N,2) polygon vertices in (x,y) pixel coords, or None."""
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
     largest = max(contours, key=cv2.contourArea)
     simplified = cv2.approxPolyDP(largest, epsilon_px, closed=True)
-    return simplified.reshape(-1, 2)
+    pts = simplified.reshape(-1, 2)
+
+    if len(parcel_points) == 0:
+        return pts  # no points detected, we keep the contour as it is
+
+    keep = np.array([min_dist_to_points(p, parcel_points) < snap_dist_px for p in pts])
+    filtered = pts[keep]
+
+    if len(filtered) < 3:
+        return pts   # the filter removed too many points, otherwise the polygon becomes invalid
+
+    return filtered
 
 
-def vectorize_all_parcels(parcel_labels, epsilon_px=DP_EPSILON_PX, min_area_px=MIN_PARCEL_AREA_PX):
+def vectorize_all_parcels(parcel_labels, simplified_points_by_parcel,
+                          epsilon_px=DP_EPSILON_PX, min_area_px=MIN_PARCEL_AREA_PX,
+                          snap_dist_px=SNAP_DIST_PX):
     """Returns dict {parcel_id: (N,2) polygon vertices}."""
     polygons = {}
     for parcel_id in np.unique(parcel_labels):
@@ -59,7 +81,8 @@ def vectorize_all_parcels(parcel_labels, epsilon_px=DP_EPSILON_PX, min_area_px=M
         mask = parcel_labels == parcel_id
         if mask.sum() < min_area_px:
             continue
-        poly = vectorize_parcel(mask, epsilon_px)
+        parcel_points = simplified_points_by_parcel.get(parcel_id, np.empty((0, 2)))
+        poly = vectorize_parcel(mask, parcel_points, epsilon_px, snap_dist_px)
         if poly is not None and len(poly) >= 3:
             polygons[parcel_id] = poly
     return polygons
@@ -149,7 +172,7 @@ def main():
         parcel_labels = label_parcels(pred['region'], pred['line'])
         raw_points = extract_point_candidates(pred['point'])
         simplified_points = assign_and_simplify(raw_points, parcel_labels)
-        polygons = vectorize_all_parcels(parcel_labels, epsilon_px=args.epsilon)
+        polygons = vectorize_all_parcels(parcel_labels, simplified_points, epsilon_px=args.epsilon)
 
         out_path = save_figure(rgb, polygons, simplified_points, stem, args.output)
         avg_vertices = np.mean([len(p) for p in polygons.values()]) if polygons else 0.0

@@ -1118,3 +1118,61 @@ Tried two things:
 reason (everything used is invariant to a monotonic transform). The noise/signal overlap
 is a real limit of what the line branch predicts, not a scale issue. Dropped from
 `label_parcels()`.
+
+---
+
+## Vectorization quality with hysteresis+watershed — worse than dilation
+
+Re-ran `vectorize_parcels.py` (which reuses `label_parcels()` from `postprocess_parcels.py`,
+so it automatically picked up hysteresis+watershed) on the same 6 patches used throughout.
+The parcel *labels* looked clean on most patches, but the vectorized polygons told a
+different story once actually inspected one by one.
+
+On `z2_r010865_c003895` (large homogeneous parcels — the case where hysteresis+watershed
+looked best at the label stage): 180 polygons vs. 84 with the old dilation approach. More
+sub-parcels recovered, but several polygons show zigzag edges where the RGB shows a
+straight boundary, and a few spurious arrow/sliver shapes with no match on the ground.
+
+On `z1_r002255_c008405` (dense mixed built/agricultural, already the weakest patch): 256
+polygons vs. 103 with dilation — worse, not just "still weak". Many jagged, multi-notch
+contours with no correspondence to real structure.
+
+**Tried raising `DP_EPSILON_PX`** (Douglas-Peucker tolerance) from 2 to 4 to 6, hoping to
+smooth out the zigzag:
+
+| epsilon | n_polygons (`z1_r002255_c008405`) | quality |
+|---|---|---|
+| 2 | 256 | dense zigzag, shapes still roughly recognizable |
+| 4 | 207 | still jagged, only marginal improvement |
+| 6 | 149 | worse — over-simplified into sharp triangles/shards |
+
+A bigger epsilon doesn't fix it, it just trades one failure mode (pixel zigzag) for another
+(over-simplification). This confirms the defect is upstream, in the segmentation itself —
+Douglas-Peucker can't turn a structurally wrong contour into a correct one at any tolerance.
+
+### Hybrid attempt: snap polygon vertices to point-branch detections — also failed
+
+Idea: since watershed clearly helps point assignment (`postprocess_parcels.py` recovers far
+more simplified points than hysteresis alone), maybe the point branch's detections could
+also validate which Douglas-Peucker vertices are real corners vs. pixel noise. Implemented
+in `vectorize_parcel()`: keep only polygon vertices within `SNAP_DIST_PX` of an assigned
+point for that parcel, falling back to the unfiltered contour if no points exist or if
+filtering leaves fewer than 3 vertices.
+
+Result: `n_polygons` came out exactly identical to the unfiltered eps=2 run, but
+`avg_vertices` dropped to ~4.1–4.5 (close to the minimum of 3), and visually the polygons
+got *more* deformed — more sharp triangles, less resemblance to real parcels.
+
+**Why it failed:** the point branch over-detects everywhere along contours (precision
+~0.09, recall ~0.86, per the earlier diagnosis — it reproduces the contour network rather
+than isolated corners). So "is there a detected point nearby" doesn't preferentially select
+real corners; it keeps a near-random subset of 3–5 vertices that happen to have a
+stray detection close by, dropping others — including real corners that just didn't have
+one nearby. The point branch signal isn't precise enough spatially to serve as a corner
+validator.
+
+**Conclusion:** dilation remains the best option for vectorization, despite merging more
+real sub-parcels than hysteresis+watershed would. Hysteresis+watershed is still worth
+keeping for point assignment in `postprocess_parcels.py` (already validated as a real
+improvement there), but not for the mask that feeds `vectorize_parcels.py`. The two uses of
+`label_parcels()` may need to be decoupled — not yet implemented.
