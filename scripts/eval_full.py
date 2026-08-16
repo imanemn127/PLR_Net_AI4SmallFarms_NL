@@ -40,7 +40,7 @@ from pycocotools.cocoeval import COCOeval
 from pycocotools import mask as coco_mask_utils
 from skimage.measure import label, regionprops
 from scipy.spatial.distance import cdist
-from shapely.geometry import Polygon as ShapelyPolygon
+from shapely.geometry import Point as ShapelyPoint, Polygon as ShapelyPolygon
 
 # boundary_iou: installed from github.com/bowenc0221/boundary-iou-api
 from boundary_iou.coco_instance_api.coco import COCO as BCOCO
@@ -132,8 +132,7 @@ def polis_one_side(coords, boundary):
     pts = list(coords)[:-1]  # skip duplicate closing vertex
     if not pts:
         return 0.0
-    return sum(boundary.distance(ShapelyPolygon([c]).centroid)
-               for c in pts) / (2 * len(pts))
+    return sum(boundary.distance(ShapelyPoint(c)) for c in pts) / (2 * len(pts))
 
 
 def polis_distance(pts_a, pts_b):

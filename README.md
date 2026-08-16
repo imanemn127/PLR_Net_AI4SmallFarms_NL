@@ -1171,8 +1171,82 @@ stray detection close by, dropping others — including real corners that just d
 one nearby. The point branch signal isn't precise enough spatially to serve as a corner
 validator.
 
-**Conclusion:** dilation remains the best option for vectorization, despite merging more
-real sub-parcels than hysteresis+watershed would. Hysteresis+watershed is still worth
-keeping for point assignment in `postprocess_parcels.py` (already validated as a real
-improvement there), but not for the mask that feeds `vectorize_parcels.py`. The two uses of
-`label_parcels()` may need to be decoupled — not yet implemented.
+**Conclusion at this point:** dilation was still the best option for vectorization.
+Hysteresis+watershed stayed worth keeping for point assignment in `postprocess_parcels.py`,
+just not for the mask feeding `vectorize_parcels.py`. Turns out the real problem was
+Douglas-Peucker, not hysteresis+watershed — see below.
+
+---
+
+## Coverage-aware vectorization: `rasterio.shapes` + `simplify_coverage`
+
+`vectorize_parcels.py` simplifies each parcel on its own, one by one (`cv2.approxPolyDP`
+in a loop). Problem: two neighboring parcels share a pixel boundary before simplification,
+but each gets rounded independently, so after simplification they don't share it anymore —
+gaps or overlaps at the shared edge. Bad for a parcel product where edges should match.
+
+New script `scripts/vectorize_parcels_coverage.py` (separate from `vectorize_parcels.py`,
+for comparison):
+
+1. `label_parcels()` unchanged (same hysteresis + watershed).
+2. `rasterio.features.shapes(labels, mask=labels>0, connectivity=4)` — vectorizes the whole
+   label raster at once, one polygon per parcel, following pixel edges exactly. No loop.
+   (`connectivity` takes 4 or 8 here, not skimage's 1/2 — crashed on this at first.)
+3. Drop polygons with area `< MIN_PARCEL_AREA_PX` (20px).
+4. `GeoDataFrame.simplify_coverage(tolerance_px)` (GeoPandas ≥ 1.1.0). Simplifies all
+   polygons together as one coverage: a shared edge between two parcels gets simplified
+   once and applied to both, so no new gap/overlap. `tolerance` in pixels (image
+   coordinates, not a real CRS).
+
+### Result
+
+Tested on the same 6 validation patches. Edges are clean and straight now, the zigzag and
+the spurious arrow shapes are gone.
+
+Polygon count barely changes vs. Douglas-Peucker (266 → 266 on `z1_r002255_c008405`).
+Normal: `simplify_coverage` never merges polygons, only reshapes them. Polygon count still
+comes entirely from `label_parcels()` — so the over-segmentation on dense mixed
+built/agricultural patches is still there, untouched by this change.
+
+**Looked a bit more into the over-segmentation:** on `z1_r002255_c008405`, ~49% of the 266
+parcels are under 100px. Raising `REGION_THRESHOLD` barely helps (0.7 → -12% parcels, need
+0.9 for -31% but that loses 22% of the region mask's area). A minimum-area filter on the
+final labels works better (100px cutoff → -49% parcels, only -14.5% area lost), and the
+dropped fragments are mostly border slivers / noise near built-up areas, not real small
+parcels. But that filter *drops* fragments instead of merging them, so it punches holes
+back into the coverage — not implemented for that reason.
+
+---
+
+## Quantitative evaluation of the post-processed pipeline
+
+`eval_full.py` evaluates the raw PLR-Net detector output, not the post-processing chain
+(`label_parcels()` + coverage vectorization). Wrote `scripts/eval_vectorize_coverage.py`
+to evaluate the actual chain in use: `all_raster` → `label_parcels()` → `rasterio.shapes`
+→ `simplify_coverage`, against the same COCO ground truth.
+
+Metrics: IoU (union of predicted vs. GT polygons), PoLiS, junction recall @3/5/8px — same
+as `eval_full.py`. No APpoly/ARpoly: `COCOeval` needs a confidence score per polygon to
+rank them, and a watershed label doesn't have one (exists or doesn't, no score left after
+thresholding).
+
+**Bug found and fixed:** `polis_one_side` built `ShapelyPolygon([c])` from a single point,
+which is invalid in Shapely and throws — silently caught by `except Exception: return
+None`. So PoLiS was always `nan`, no error shown anywhere. Same function existed in
+`eval_full.py` (copied from there), so every PoLiS value that script ever printed was also
+`nan`. Fixed both with `shapely.geometry.Point(c)` instead.
+
+### Results (`all_raster` checkpoint, epoch 100, split=test, 947 images)
+
+| Metric | Value | PLR-Net (article, Table 10) |
+|---|---|---|
+| IoU region (%) | 78.94 | 75.86 |
+| PoLiS | 1.55 | 1.51 |
+| Junction R@3px | 0.754 | — |
+| Junction R@5px | 0.902 | — |
+| Junction R@8px | 0.957 | — |
+| Pred polygons (total) | 216,499 | — |
+| GT polygons (total) | 124,584 | — |
+
+IoU and PoLiS are close to the article's numbers. Pred/GT ratio (~1.74×) confirms the
+over-segmentation at full test-split scale, not just on the hard patches seen visually.
