@@ -1203,6 +1203,10 @@ for comparison):
 Tested on the same 6 validation patches. Edges are clean and straight now, the zigzag and
 the spurious arrow shapes are gone.
 
+Best case (`z2_r010865_c003895` — large homogeneous parcels):
+
+![Coverage vectorization, best case](docs/img/coverage_vectorization_best_case.png)
+
 Polygon count barely changes vs. Douglas-Peucker (266 → 266 on `z1_r002255_c008405`).
 Normal: `simplify_coverage` never merges polygons, only reshapes them. Polygon count still
 comes entirely from `label_parcels()` — so the over-segmentation on dense mixed
