@@ -1,0 +1,44 @@
+SOLVER:
+  IMS_PER_BATCH: 8
+  BASE_LR: 1e-4
+  MAX_EPOCH: 150
+  STEPS: (25,)
+  WEIGHT_DECAY: 0.0001
+  CHECKPOINT_PERIOD: 1
+  OPTIMIZER: "ADAM"
+  AMSGRAD: True
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+DATASETS:
+  IMAGE:
+    PIXEL_MEAN: [0.0545, 0.0768, 0.0668]
+    PIXEL_STD: [0.0298, 0.0314, 0.0397]
+    TO_255: False
+    HEIGHT: 256
+    WIDTH: 256
+  TARGET:
+    HEIGHT: 256
+    WIDTH: 256
+  ORIGIN:
+    HEIGHT: 256
+    WIDTH: 256
+  ROTATE_F: True
+  TRAIN: ("nl_brp_train",)
+  TEST: ("nl_brp_val",)
+
+MODEL:
+  NAME: "Swin_ViT"
+  HEAD_SIZE: [[2]]
+  OUT_FEATURE_CHANNELS: 64
+  LOSS_WEIGHTS:
+    loss_joff: 0.25
+    loss_jloc: 4.0
+    loss_mask: 1.0
+    loss_afm : 0.1
+    loss_remask : 1.0
+  JLOC_POS_WEIGHT: 50.0
+  ACTIVE_BRANCH: "all_raster"
+
+OUTPUT_DIR: "/mnt/DATA/IMANE/PLR-Net_output/PLR-Net/nl_brp_raster_swin/all_raster"

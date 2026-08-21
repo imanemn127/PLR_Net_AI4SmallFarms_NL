@@ -61,9 +61,9 @@ step3_extract_patches.py   → patches/train/  6,942 patches
        ↓
 split_train_val.py         → train.txt (5,553)  val.txt (1,389)
        ↓
-step5_build_coco.py        → coco/train_coco.json  (358,996 annotations)
-                           → coco/val_coco.json    ( 89,838 annotations)
-                           → coco/test_coco.json   ( 96,910 annotations)
+step5_build_coco.py        → coco/train_coco.json  (344,764 annotations, 3,686 images)
+                           → coco/val_coco.json    ( 88,481 annotations,   922 images)
+                           → coco/test_coco.json   (124,584 annotations,   947 images)
        ↓
 compute_normalization.py   → PIXEL_MEAN / PIXEL_STD for PLR-Net.yaml
 ```
@@ -1254,3 +1254,44 @@ None`. So PoLiS was always `nan`, no error shown anywhere. Same function existed
 
 IoU and PoLiS are close to the article's numbers. Pred/GT ratio (~1.74×) confirms the
 over-segmentation at full test-split scale, not just on the hard patches seen visually.
+
+---
+
+## Backbone ablation: BSiNet (CNN) vs. Swin Transformer
+
+Tried replacing the BSiNet CNN encoder with a pretrained Swin Transformer, to see whether
+a transformer backbone helps before committing to a full temporal ViT (ViT for SITS).
+
+New `PLRNet/backbones/swin_backbone.py` (`Swin_ViT`, registered separately — `BsiNet_2`
+untouched): Swin-Tiny encoder (`timm`, ImageNet weights) + the same conv decoder with
+skip-connections as `BsiNet_2`, same interface (`forward(x) -> (out, features)`, 64-channel
+output), so nothing downstream (heads, losses, post-processing) needed to change.
+
+Went with Swin instead of a plain ViT: a vanilla ViT only gives one low-res feature map
+(fixed ×16 reduction), which doesn't work with the decoder's multi-scale skip-connections.
+Swin outputs a native 4-level pyramid (×4/×8/×16/×32), matching the CNN encoder it
+replaces. Note: `timm`'s Swin `features_only=True` output is NHWC, not NCHW — needs a
+`permute(0,3,1,2)` before any conv.
+
+Trained 150 epochs, same data/splits as BSiNet. Best checkpoint at epoch 50 (not 150 like
+BSiNet) — val loss plateaus earlier, consistent with a pretrained encoder converging (and
+saturating) faster than one trained from scratch.
+
+### Results (`eval_vectorize_coverage.py`, split=test, 947 images)
+
+| Metric | BSiNet | Swin-ViT |
+|---|---|---|
+| IoU region (%) | 78.94 | 78.22 |
+| PoLiS | 1.55 | 1.63 |
+| Junction R@3px | 0.754 | 0.716 |
+| Junction R@5px | 0.902 | 0.876 |
+| Junction R@8px | 0.957 | 0.941 |
+| Pred polygons (total) | 216,499 | 185,493 |
+
+No net gain from the transformer backbone — slightly worse on every geometric metric.
+One upside: less over-segmentation (185k vs. 216k predicted polygons for the same GT
+count). The point branch fails the same way on both backbones (high recall, very low
+precision — fires along the whole contour network instead of isolated corners), which
+means that's not an encoder capacity problem. Takeaway: a spatial-only transformer isn't
+the fix here — motivates moving to a genuinely temporal architecture (ViT for SITS) instead
+of further tuning a single-date ViT.
